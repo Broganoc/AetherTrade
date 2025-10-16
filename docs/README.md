@@ -63,11 +63,11 @@ This will launch:
 
 - FastAPI backend services (Trainer & Simulator)
 - Redis for task queue
-- React dashboard on default port 3000
+- Vite dashboard on default port 5173
 
 ### 3. Access the dashboard
 
-Open your browser and navigate to:
+Open your browser and navigate to Vite/Vue:
 
 **http://localhost:5173**
 
