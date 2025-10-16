@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   redis:
     image: redis:7
@@ -8,29 +6,29 @@ services:
       - "6379:6379"
 
   trainer:
-    build: ../backend/trainer
+    build:
+      context: ../backend/trainer
+      dockerfile: Dockerfile
     container_name: aethertrade_trainer
-    volumes:
-      - ../backend/trainer:/app
-    command: uvicorn main:app --host 0.0.0.0 --port 8001
-    depends_on:
-      - redis
     ports:
       - "8001:8001"
-
-  simulator:
-    build: ../backend/simulator
-    container_name: aethertrade_simulator
-    volumes:
-      - ../backend/simulator:/app
-    command: uvicorn main:app --host 0.0.0.0 --port 8002
     depends_on:
       - redis
+
+  simulator:
+    build:
+      context: ../backend/simulator
+      dockerfile: Dockerfile
+    container_name: aethertrade_simulator
     ports:
       - "8002:8002"
+    depends_on:
+      - redis
 
   dashboard:
-    build: ../frontend/dashboard
+    build:
+      context: ../frontend/dashboard
+      dockerfile: Dockerfile
     container_name: aethertrade_dashboard
     ports:
-      - "3000:3000"
+      - "5173:5173"
