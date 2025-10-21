@@ -1,16 +1,15 @@
 <template>
-  <div>
-    <!-- Navbar -->
-    <nav class="navbar">
-      <div class="font-bold text-lg">AetherTrade Dashboard</div>
-      <div>
-        <a href="#" @click.prevent="activeTab = 'training'" :class="{ 'text-blue-600': activeTab==='training' }">Training</a>
-        <a href="#" @click.prevent="activeTab = 'simulator'" :class="{ 'text-blue-600': activeTab==='simulator' }">Simulator</a>
-      </div>
-    </nav>
+  <div :class="{ dark: isDarkMode }" class="min-h-screen bg-gray-50 dark:bg-gray-900 text-gray-900 dark:text-gray-200">
+    <!-- NavBar -->
+    <NavBar
+      :active-tab="activeTab"
+      :is-dark="isDarkMode"
+      @toggle-dark="toggleDarkMode"
+      @change-tab="activeTab = $event"
+    />
 
     <!-- Tab content -->
-    <div class="tab-content">
+    <div class="tab-content p-6">
       <TrainingTab v-if="activeTab === 'training'" />
       <SimulatorTab v-if="activeTab === 'simulator'" />
     </div>
@@ -20,12 +19,19 @@
 <script>
 import TrainingTab from './components/TrainingTab.vue'
 import SimulatorTab from './components/SimulatorTab.vue'
+import NavBar from './components/NavBar.vue'
 
 export default {
-  components: { TrainingTab, SimulatorTab },
+  components: { TrainingTab, SimulatorTab, NavBar },
   data() {
     return {
-      activeTab: 'training'
+      activeTab: 'training',
+      isDarkMode: false
+    }
+  },
+  methods: {
+    toggleDarkMode() {
+      this.isDarkMode = !this.isDarkMode
     }
   }
 }
