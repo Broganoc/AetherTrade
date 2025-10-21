@@ -1,92 +1,124 @@
 from fastapi import FastAPI, BackgroundTasks, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import List
 from datetime import date
-import os
 from pathlib import Path
+import json
 from train import train_agent
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 
+# -------------------------------
+# Persistent paths (match Docker volumes)
+# -------------------------------
+MODELS_DIR = Path("/app/models")
+LOGS_DIR = Path("/app/logs")
+STATUS_FILE = LOGS_DIR / "training_status.json"
 
-app = FastAPI(title="AetherTrade Trainer")
+MODELS_DIR.mkdir(parents=True, exist_ok=True)
+LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
-# Allow all origins for dev
+# -------------------------------
+# FastAPI app
+# -------------------------------
+app = FastAPI(title="AetherTrade Trainer API")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # dev only; production: specify frontend URL
+    allow_origins=["*"],  # development only
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ---- Model definitions ----
+# -------------------------------
+# Schemas
+# -------------------------------
 class ModelMetrics(BaseModel):
-    train_accuracy: float
-    validation_accuracy: float
+    mean_reward: float | None = None
+    mean_episode_length: float | None = None
 
 class TrainedModel(BaseModel):
     model_name: str
-    version: str
-    checksum: str
+    symbol: str
     framework: str
     trained_on: str
-    features: List[str]
+    path: str
     metrics: ModelMetrics
 
-# ---- Helper to list trained models ----
-def get_trained_models():
+# -------------------------------
+# Helpers
+# -------------------------------
+def get_trained_models() -> List[TrainedModel]:
     models = []
-    models_dir = "./models"
-    if os.path.exists(models_dir):
-        for f in os.listdir(models_dir):
-            if f.endswith(".zip"):
-                models.append(
-                    TrainedModel(
-                        model_name=f.split(".zip")[0],
-                        version="1.0.0",
-                        checksum="dummy_checksum",
-                        framework="stable-baselines3",
-                        trained_on=str(date.today()),
-                        features=["RSI", "VWAP", "EMA(9)", "MACD", "VolumeProfiles", "Volume"],
-                        metrics=ModelMetrics(train_accuracy=0.8, validation_accuracy=0.75)
-                    )
+
+    if not MODELS_DIR.exists():
+        return models
+
+    for file in MODELS_DIR.glob("*.zip"):
+        # Extract model_name and symbol from filename
+        parts = file.stem.split("_")
+        model_name = "_".join(parts[:-1])
+        symbol = parts[-1]
+
+        # Default metrics
+        metrics = ModelMetrics(mean_reward=None, mean_episode_length=None)
+
+        # Load metrics if available
+        if STATUS_FILE.exists():
+            with STATUS_FILE.open() as f:
+                status_data = json.load(f)
+            if (
+                status_data.get("symbol") == symbol
+                and status_data.get("status") == "completed"
+            ):
+                metrics = ModelMetrics(
+                    mean_reward=status_data.get("mean_reward"),
+                    mean_episode_length=status_data.get("mean_episode_length"),
                 )
+
+        models.append(
+            TrainedModel(
+                model_name=model_name,
+                symbol=symbol,
+                framework="stable-baselines3",
+                trained_on=str(date.today()),
+                path=str(file),  # absolute path in container (host-mapped)
+                metrics=metrics,
+            )
+        )
+
     return models
 
+# -------------------------------
+# Routes
+# -------------------------------
 @app.get("/models", response_model=List[TrainedModel])
-def models():
+def list_models():
+    """List all trained models and their metrics"""
     return get_trained_models()
 
-# ---- Run training endpoint ----
 @app.post("/train")
 def run_training(
     background_tasks: BackgroundTasks,
     symbol: str = Query(..., description="Stock symbol to train on"),
-    model_name: str = Query("ppo_agent_v1", description="Name of the saved model"),
-    timesteps: int = Query(50000, description="Number of training timesteps")
+    model_name: str = Query("ppo_agent_v1", description="Base name of the saved model"),
+    timesteps: int = Query(10000, description="Number of training timesteps"),
 ):
-    """
-    Trigger a training job in the background for a specific stock symbol.
-    """
-    # Ensure models directory exists
-    Path("./models").mkdir(parents=True, exist_ok=True)
-
-    # Start training asynchronously
-    background_tasks.add_task(train_agent, symbol=symbol, model_name=model_name, total_timesteps=timesteps)
-
+    """Start a background training job"""
+    background_tasks.add_task(train_agent, symbol, model_name, timesteps)
     return {
-        "status": "Training started in background",
+        "status": "started",
         "symbol": symbol,
         "model_name": model_name,
-        "timesteps": timesteps
+        "timesteps": timesteps,
     }
-
 
 @app.get("/training_status")
 def training_status():
-    if os.path.exists("./training_status.json"):
-        with open("./training_status.json") as f:
-            data = json.load(f)
-        return JSONResponse(content=data)
-    return {"status": "idle"}
+    """Return current training progress"""
+    if not STATUS_FILE.exists():
+        return {"status": "idle"}
+    with STATUS_FILE.open() as f:
+        data = json.load(f)
+    return JSONResponse(content=data)

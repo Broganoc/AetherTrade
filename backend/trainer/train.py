@@ -1,58 +1,105 @@
-import os
 import json
 from pathlib import Path
+from datetime import datetime
+import numpy as np
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.monitor import Monitor
 from env import OptionTradingEnv
-import numpy as np
 
-STATUS_FILE = "./training_status.json"
-MODELS_DIR = "./models"
+# -------------------------------
+# Persistent directories (mapped in Docker)
+# -------------------------------
+MODELS_DIR = Path("/app/models")
+LOGS_DIR = Path("/app/logs")
 
-os.makedirs(MODELS_DIR, exist_ok=True)
+MODELS_DIR.mkdir(parents=True, exist_ok=True)
+LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
+STATUS_FILE = LOGS_DIR / "training_status.json"
 
-def write_status(status: dict):
-    """Helper to write progress to JSON file"""
-    with open(STATUS_FILE, "w") as f:
-        json.dump(status, f, indent=4)
+# -------------------------------
+# Helper functions
+# -------------------------------
+def write_status(data: dict):
+    """Write training status to JSON file with timestamp."""
+    data["last_update"] = datetime.utcnow().isoformat()
+    with STATUS_FILE.open("w") as f:
+        json.dump(data, f, indent=4)
 
+def compute_model_stats(model):
+    """Compute episode statistics if available."""
+    if not model.ep_info_buffer:
+        return {"mean_reward": None, "mean_length": None}
+    rewards = [ep["r"] for ep in model.ep_info_buffer if "r" in ep]
+    lengths = [ep["l"] for ep in model.ep_info_buffer if "l" in ep]
+    return {
+        "mean_reward": float(np.mean(rewards)) if rewards else None,
+        "mean_length": float(np.mean(lengths)) if lengths else None,
+    }
 
-def train_agent(symbol: str, model_name: str = "ppo_agent_v1", total_timesteps: int = 50000):
+# -------------------------------
+# Main training function
+# -------------------------------
+def train_agent(symbol: str, model_name: str = "ppo_agent_v1", total_timesteps: int = 10000):
     """
-    Train an RL agent for option trading on a specific stock symbol.
-    Saves model and updates training_status.json
+    Train a PPO agent for a given stock symbol.
+    Model and logs are saved in persistent Docker-mounted directories.
     """
-    # Initialize environment
-    env = OptionTradingEnv(symbol)
-    env = Monitor(env)
-    env = DummyVecEnv([lambda: env])
+    try:
+        # --- Setup environment ---
+        env = OptionTradingEnv(symbol)
+        env = Monitor(env)
+        env = DummyVecEnv([lambda: env])
 
-    # Initialize model
-    model = PPO("MlpPolicy", env, verbose=1)
+        # --- Initialize model ---
+        model = PPO("MlpPolicy", env, verbose=1)
 
-    # Initialize status
-    write_status({"status": "started", "iteration": 0, "total_timesteps": total_timesteps, "symbol": symbol})
+        # --- Training setup ---
+        chunks = 5
+        chunk_steps = total_timesteps // chunks
 
-    # Split training into 5 chunks to update progress
-    chunks = 5
-    chunk_steps = total_timesteps // chunks
-
-    for i in range(chunks):
-        model.learn(total_timesteps=chunk_steps, reset_num_timesteps=False)
-        # Update progress
         write_status({
-            "status": "training",
-            "iteration": i + 1,
-            "total_iterations": chunks,
-            "last_ep_rew_mean": np.mean([ep['r'] for ep in model.ep_info_buffer]) if model.ep_info_buffer else None,
-            "symbol": symbol
+            "status": "started",
+            "symbol": symbol,
+            "model_name": model_name,
+            "total_timesteps": total_timesteps,
+            "chunks": chunks,
+            "current_chunk": 0,
         })
 
-    # Save model with dynamic name
-    model_path = Path(MODELS_DIR) / f"{model_name}_{symbol}.zip"
-    model.save(model_path)
+        # --- Progressive training ---
+        for i in range(chunks):
+            model.learn(total_timesteps=chunk_steps, reset_num_timesteps=False)
+            stats = compute_model_stats(model)
 
-    # Mark done
-    write_status({"status": "completed", "model_path": str(model_path), "symbol": symbol})
+            write_status({
+                "status": "training",
+                "symbol": symbol,
+                "model_name": model_name,
+                "progress": f"{(i + 1) / chunks:.0%}",
+                "current_chunk": i + 1,
+                "chunks": chunks,
+                "mean_reward": stats["mean_reward"],
+                "mean_episode_length": stats["mean_length"],
+            })
+
+        # --- Save model ---
+        model_path = MODELS_DIR / f"{model_name}_{symbol}.zip"
+        model.save(str(model_path))
+
+        # --- Final status ---
+        write_status({
+            "status": "completed",
+            "symbol": symbol,
+            "model_name": model_name,
+            "model_path": str(model_path),
+            "mean_reward": stats["mean_reward"],
+            "mean_episode_length": stats["mean_length"],
+        })
+
+        print(f"✅ Training completed for {symbol}. Model saved to {model_path}")
+
+    except Exception as e:
+        write_status({"status": "error", "message": str(e), "symbol": symbol})
+        raise
