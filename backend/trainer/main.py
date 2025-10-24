@@ -6,7 +6,8 @@ from typing import List
 from datetime import date
 from pathlib import Path
 import json
-from train import train_agent, train_agent_stream
+from trainer.train import train_agent, train_agent_stream
+
 
 # -------------------------------
 # Persistent paths (match Docker volumes)
@@ -74,14 +75,15 @@ def get_trained_models() -> List[TrainedModel]:
                 )
 
         models.append(
-            TrainedModel(
-                model_name=model_name,
-                symbol=symbol,
-                framework="stable-baselines3",
-                trained_on=str(date.today()),
-                path=str(file),
-                metrics=metrics,
-            )
+            {
+                "model_name": model_name,
+                "symbol": symbol,
+                "framework": "stable-baselines3",
+                "trained_on": str(date.today()),
+                "path": str(file),
+                "metrics": metrics.dict(),
+                "full_name": f"{model_name}_{symbol}",  # 👈 add this
+            }
         )
 
     return models
@@ -89,9 +91,8 @@ def get_trained_models() -> List[TrainedModel]:
 # -------------------------------
 # Routes
 # -------------------------------
-@app.get("/models", response_model=List[TrainedModel])
+@app.get("/models")
 def list_models():
-    """List all trained models and their metrics"""
     return get_trained_models()
 
 

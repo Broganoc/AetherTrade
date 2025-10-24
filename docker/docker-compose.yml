@@ -4,30 +4,37 @@ services:
     container_name: aethertrade_redis
     ports:
       - "6379:6379"
+    volumes:
+      - redis_data:/data
 
   trainer:
     build:
-      context: ../backend/trainer
-      dockerfile: Dockerfile
+      context: ../backend
+      dockerfile: trainer/Dockerfile
     container_name: aethertrade_trainer
     ports:
       - "8001:8001"
     depends_on:
       - redis
     volumes:
-      # Persist models and logs on the host
-      - ../backend/trainer/models:/app/models
-      - ../backend/trainer/logs:/app/logs
+      - models:/app/models
+      - logs:/app/logs
+    environment:
+      - PYTHONUNBUFFERED=1
 
   simulator:
     build:
-      context: ../backend/simulator
-      dockerfile: Dockerfile
+      context: ../backend
+      dockerfile: simulator/Dockerfile
     container_name: aethertrade_simulator
     ports:
       - "8002:8002"
     depends_on:
       - redis
+    volumes:
+      - models:/app/models
+    environment:
+      - PYTHONUNBUFFERED=1
 
   dashboard:
     build:
@@ -36,3 +43,14 @@ services:
     container_name: aethertrade_dashboard
     ports:
       - "5173:5173"
+    volumes:
+      - ../frontend/dashboard:/app
+      - /app/node_modules
+    environment:
+      - VUE_APP_TRAINER_URL=http://aethertrade_trainer:8001
+      - VUE_APP_SIMULATOR_URL=http://aethertrade_simulator:8002
+
+volumes:
+  models:
+  logs:
+  redis_data:

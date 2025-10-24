@@ -58,23 +58,41 @@ class OptionTradingEnv(gym.Env):
     # Indicators
     # ------------------------------
     def _add_indicators(self):
-        def ensure_series(x):
-            if isinstance(x, pd.DataFrame):
-                return x.squeeze()
-            return pd.Series(x) if not isinstance(x, pd.Series) else x
+        """
+        Add technical indicators to the price DataFrame safely.
+        Ensures all inputs to the TA functions are Pandas Series (not scalars).
+        """
 
+        def ensure_series(x):
+            """
+            Guarantee that the returned object is a 1D pandas Series.
+            Handles scalars, numpy arrays, and single-column DataFrames gracefully.
+            """
+            if isinstance(x, pd.Series):
+                return x
+            if isinstance(x, pd.DataFrame):
+                # If DataFrame has one column, return that column as Series
+                if x.shape[1] == 1:
+                    return x.iloc[:, 0]
+                raise ValueError("Expected single-column DataFrame for indicator input")
+            # Convert scalars or numpy arrays to Series
+            return pd.Series(np.atleast_1d(x))
+
+        # Extract columns safely
         close = ensure_series(self.df["Close"])
         high = ensure_series(self.df["High"])
         low = ensure_series(self.df["Low"])
         volume = ensure_series(self.df["Volume"])
 
-        self.df["RSI"] = ta.momentum.RSIIndicator(close, window=14).rsi()
+        # Add indicators (all based on Series)
+        self.df["RSI"] = ta.momentum.RSIIndicator(close=close, window=14).rsi()
         self.df["VWAP"] = ta.volume.volume_weighted_average_price(
             high=high, low=low, close=close, volume=volume, window=14
         )
-        self.df["EMA9"] = ta.trend.EMAIndicator(close, window=9).ema_indicator()
-        self.df["MACD"] = ta.trend.MACD(close).macd()
+        self.df["EMA9"] = ta.trend.EMAIndicator(close=close, window=9).ema_indicator()
+        self.df["MACD"] = ta.trend.MACD(close=close).macd()
 
+        # Clean up
         self.df.dropna(inplace=True)
         self.df.reset_index(drop=True, inplace=True)
 
@@ -125,8 +143,8 @@ class OptionTradingEnv(gym.Env):
     def step(self, action):
         # Current day's data
         row = self.df.iloc[self.current_step]
-        open_price = float(row["Open"].iloc[0])
-        close_price = float(row["Close"].iloc[0])
+        open_price = float(row["Open"])
+        close_price = float(row["Close"])
         price_change = (close_price - open_price) / open_price
 
         # Option price change approximation (long-dated)

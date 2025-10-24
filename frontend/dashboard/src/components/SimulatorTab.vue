@@ -9,8 +9,8 @@
           <label class="block text-sm font-medium mb-1 dark:text-gray-200">Model</label>
           <select v-model="selectedModel" class="w-full p-2 border rounded bg-white dark:bg-gray-700 dark:text-gray-200">
             <option value="">Select Model</option>
-            <option v-for="model in models" :key="model.model_name" :value="model.model_name">
-              {{ model.model_name }}
+            <option v-for="model in models" :key="model.full_name" :value="model.full_name">
+              {{ model.full_name }}
             </option>
           </select>
         </div>
@@ -43,7 +43,10 @@
     </div>
 
     <!-- Simulation Summary -->
-    <div v-if="simulatorData" class="bg-white dark:bg-gray-800 p-6 rounded-lg shadow mb-6 relative z-10">
+    <div
+      v-if="simulatorData"
+      class="bg-white dark:bg-gray-800 p-6 rounded-lg shadow mb-6 relative z-10"
+    >
       <h3 class="text-lg font-semibold mb-2 dark:text-gray-100">Simulation Summary</h3>
       <div class="grid grid-cols-1 md:grid-cols-3 gap-2 text-sm dark:text-gray-200">
         <p><strong>Model Used:</strong> {{ simulatorData.model_used }}</p>
@@ -58,18 +61,85 @@
       </div>
     </div>
 
+    <!-- Trade Log Table -->
+    <div
+      v-if="trades.length"
+      class="bg-white dark:bg-gray-800 p-6 rounded-lg shadow relative z-10"
+    >
+      <div class="flex items-center justify-between mb-3">
+        <h3 class="text-lg font-semibold dark:text-gray-100">Trade Log</h3>
+        <button
+          @click="downloadCSV"
+          class="bg-green-600 hover:bg-green-700 text-white text-sm px-3 py-1 rounded"
+        >
+          Download CSV
+        </button>
+      </div>
+
+      <div class="overflow-x-auto">
+        <table class="min-w-full text-sm border-collapse border border-gray-300 dark:border-gray-700">
+          <thead class="bg-gray-200 dark:bg-gray-700 text-gray-800 dark:text-gray-100">
+            <tr>
+              <th class="px-3 py-2 border border-gray-300 dark:border-gray-700">Step</th>
+              <th class="px-3 py-2 border border-gray-300 dark:border-gray-700">Date</th>
+              <th class="px-3 py-2 border border-gray-300 dark:border-gray-700">Action</th>
+              <th class="px-3 py-2 border border-gray-300 dark:border-gray-700">Price Δ (%)</th>
+              <th class="px-3 py-2 border border-gray-300 dark:border-gray-700">Option Return (%)</th>
+              <th class="px-3 py-2 border border-gray-300 dark:border-gray-700">Portfolio ($)</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr
+              v-for="trade in trades"
+              :key="trade.step"
+              class="border-t border-gray-300 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700"
+            >
+              <td class="px-3 py-1 text-center">{{ trade.step }}</td>
+              <td class="px-3 py-1 text-center">{{ trade.date }}</td>
+              <td class="px-3 py-1 text-center">{{ trade.action }}</td>
+              <td class="px-3 py-1 text-center">{{ trade.price_change_pct }}</td>
+              <td class="px-3 py-1 text-center">{{ trade.option_return_pct }}</td>
+              <td class="px-3 py-1 text-center">
+                ${{ trade.portfolio_value.toLocaleString() }}
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
     <!-- Running Simulation Overlay -->
     <transition name="fade">
       <div
         v-if="isRunning"
         class="fixed inset-0 bg-black/40 flex items-center justify-center z-50"
       >
-        <div class="bg-white dark:bg-gray-800 p-6 rounded-lg shadow-lg flex items-center space-x-4">
-          <svg class="animate-spin h-6 w-6 text-blue-600" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
-            <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
-            <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"></path>
+        <div
+          class="bg-white dark:bg-gray-800 p-6 rounded-lg shadow-lg flex items-center space-x-4"
+        >
+          <svg
+            class="animate-spin h-6 w-6 text-blue-600"
+            xmlns="http://www.w3.org/2000/svg"
+            fill="none"
+            viewBox="0 0 24 24"
+          >
+            <circle
+              class="opacity-25"
+              cx="12"
+              cy="12"
+              r="10"
+              stroke="currentColor"
+              stroke-width="4"
+            ></circle>
+            <path
+              class="opacity-75"
+              fill="currentColor"
+              d="M4 12a8 8 0 018-8v8H4z"
+            ></path>
           </svg>
-          <span class="font-semibold text-gray-700 dark:text-gray-200">Running Simulation...</span>
+          <span class="font-semibold text-gray-700 dark:text-gray-200">
+            Running Simulation...
+          </span>
         </div>
       </div>
     </transition>
@@ -86,6 +156,7 @@ export default {
       endDate: "",
       portfolioStart: 100000,
       simulatorData: null,
+      trades: [], // ✅ declare here
       validationError: "",
       isRunning: false,
     };
@@ -128,16 +199,44 @@ export default {
           }),
         });
 
+        if (!response.ok) {
+          const err = await response.json();
+          throw new Error(err.detail || "Simulation failed");
+        }
+
         const data = await response.json();
         this.simulatorData = data.summary;
+        this.trades = data.trades || [];
       } catch (err) {
         console.error("Simulation failed:", err);
-        this.validationError = "Simulation failed. Check backend logs.";
+        this.validationError = err.message || "Simulation failed. Check backend logs.";
       } finally {
         this.isRunning = false;
       }
-    }
-  }
+    },
+
+    // ✅ Download CSV handler
+    downloadCSV() {
+      if (!this.trades.length) return;
+
+      const headers = Object.keys(this.trades[0]);
+      const csvRows = [
+        headers.join(","), // header row
+        ...this.trades.map(trade =>
+          headers.map(h => JSON.stringify(trade[h] ?? "")).join(",")
+        ),
+      ];
+      const blob = new Blob([csvRows.join("\n")], { type: "text/csv" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `${this.selectedModel}_trade_log.csv`;
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+    },
+  },
 };
 </script>
 

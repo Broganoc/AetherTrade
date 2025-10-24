@@ -1,4 +1,5 @@
-import json
+import json, redis
+import os
 from pathlib import Path
 from datetime import datetime
 import numpy as np
@@ -6,7 +7,8 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.callbacks import CheckpointCallback
-from env import OptionTradingEnv
+from shared.env import OptionTradingEnv
+
 
 # -------------------------------
 # Persistent directories (mapped in Docker)
@@ -22,11 +24,11 @@ STATUS_FILE = LOGS_DIR / "training_status.json"
 # -------------------------------
 # Helper functions
 # -------------------------------
-def write_status(data: dict):
-    """Write training status to JSON file with timestamp."""
-    data["last_update"] = datetime.utcnow().isoformat()
-    with STATUS_FILE.open("w") as f:
-        json.dump(data, f, indent=4)
+r = redis.Redis(host=os.getenv("REDIS_HOST", "aethertrade_redis"), port=6379)
+
+def write_status(data):
+    data["last_update"] = datetime.now().isoformat()
+    r.set("training_status", json.dumps(data))
 
 
 def compute_model_stats(model):
