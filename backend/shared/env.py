@@ -94,7 +94,14 @@ class OptionTradingEnv(gym.Env):
 
         # Clean up
         self.df.dropna(inplace=True)
-        self.df.reset_index(drop=True, inplace=True)
+
+        # <- keep actual trading dates as a column
+        self.df.reset_index(inplace=True)
+        if "Date" not in self.df.columns:
+            self.df.rename(columns={self.df.columns[0]: "Date"}, inplace=True)
+
+        # Convert to timezone-aware UTC before stripping date
+        self.df["Date"] = pd.to_datetime(self.df["Date"], utc=True).dt.tz_convert("US/Eastern").dt.date
 
     # ------------------------------
     # Feature normalization
