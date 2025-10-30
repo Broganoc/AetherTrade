@@ -1,314 +1,419 @@
-# backend/simulator/main.py
-# Simulation server for running trading model backtests.
-# Run with: uvicorn backend.simulator.main:app --port 8002
-
-from fastapi import FastAPI, HTTPException
+# simulator/main.py
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from fastapi.responses import JSONResponse
 from pathlib import Path
+from datetime import datetime, timedelta, date
+from math import log, sqrt, exp, floor
+import json
+import traceback
 import numpy as np
 import pandas as pd
-from datetime import datetime, timedelta
 import yfinance as yf
+from scipy.stats import norm
+
 from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+from stable_baselines3.common.monitor import Monitor
 
 from shared.env import OptionTradingEnv
 
-app = FastAPI()
+MODELS_DIR = Path("/app/models")
+RESULTS_DIR = Path("/app/results")
+MODELS_DIR.mkdir(parents=True, exist_ok=True)
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+# ------------------------------------------------------------
+# FastAPI Setup
+# ------------------------------------------------------------
+app = FastAPI(title="AetherTrade Simulator API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # adjust later for security
+    allow_origins=["*"],  # dev only
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-MODELS_DIR = Path("/app/models")
-
-
-# ---------------------------------------------------------------------
-# Custom environment for simulation (deterministic, sequential)
-# ---------------------------------------------------------------------
-class SimOptionTradingEnv(OptionTradingEnv):
-    def __init__(self, symbol: str, start: str, end: str, lookback_days: int = 30):
-        # Extend start date for data load to give indicator warm-up
-        self.lookback_days = lookback_days
-        start_dt = datetime.strptime(start, "%Y-%m-%d") - timedelta(days=self.lookback_days)
-        super().__init__(symbol=symbol, start=start_dt.strftime("%Y-%m-%d"), end=end)
-
-    def reset(self, seed=None, options=None):
-        # Skip lookback window so first trade == user start date
-        self.current_step = self.lookback_days
-        self.episode_end = len(self.df) - 1
-        if self.current_step > self.episode_end:
-            raise ValueError("Date range too short for lookback window")
-        return self._get_observation(), {}
-
-
-# ---------------------------------------------------------------------
-# Helper to pull option details (midpoint pricing, directional strike)
-# ---------------------------------------------------------------------
-def get_option_details(symbol: str, date: str, action: str, underlying_price: float):
+# ------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------
+def make_env(symbol, start="2020-01-01", end="2025-01-01", full_run=False):
     """
-    Pull option info from Yahoo Finance:
-      - Expiration = trade date + 30 days
-      - CALL: nearest strike ABOVE price
-      - PUT: nearest strike BELOW price
-      - Price = midpoint of bid/ask if available, else fallback
+    Factory to create a monitored OptionTradingEnv.
+    full_run=True → full-dataset simulation
+    full_run=False → short random episodes (training)
+    """
+    def _init():
+        env = OptionTradingEnv(symbol=symbol, start=start, end=end)
+        env.reset(full_run=full_run)        # pass the flag through
+        if not hasattr(env, "leverage"):
+            env.leverage = 10.0
+        return Monitor(env)
+    return _init
+
+
+def round_to_increment(x: float, inc: float) -> float:
+    return round(x / inc) * inc
+
+def choose_strike(open_price: float, action: str, increment: float = 1.0) -> float:
+    """
+    Choose a realistic OTM strike.
+    CALL: round UP to next increment above open * (1 + 1%)
+    PUT:  round DOWN to next increment below open * (1 - 1%)
+    """
+    if action == "CALL":
+        raw_strike = open_price * 1.01
+        strike = np.ceil(raw_strike / increment) * increment
+    elif action == "PUT":
+        raw_strike = open_price * 0.99
+        strike = np.floor(raw_strike / increment) * increment
+    else:
+        strike = open_price  # not used for HOLD
+    return float(round(strike, 2))
+
+
+def black_scholes_price(S: float, K: float, T: float, r: float, sigma: float, opt_type: str) -> float:
+
+    # Guardrails
+    sigma = max(0.01, float(sigma))
+    S = max(1e-8, float(S))
+    K = max(1e-8, float(K))
+    T = max(1e-6, float(T))  # in years
+    r = float(r)
+
+    d1 = (log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * sqrt(T))
+    d2 = d1 - sigma * sqrt(T)
+
+    opt_type = opt_type.upper()
+    if opt_type == "CALL":
+        return S * norm.cdf(d1) - K * exp(-r * T) * norm.cdf(d2)
+    elif opt_type == "PUT":
+        return K * exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
+    else:
+        raise ValueError(f"Unknown option type: {opt_type}")
+
+
+def load_chain_iv(symbol: str, approx_expiry: date, strike: float, opt_type: str):
+    """
+    Try to fetch a near 30D expiry and return yahoo IV for the nearest strike.
+    Note: Yahoo chains are *current*, not historical. We only use IV as a proxy for sigma.
     """
     try:
-        ticker = yf.Ticker(symbol)
-        expirations = ticker.options
-        if not expirations:
-            raise ValueError("No expirations found")
+        tk = yf.Ticker(symbol)
+        expiries = tk.options or []
+        if not expiries:
+            return None, None
 
-        expiration_date = pd.Timestamp(date) + pd.Timedelta(days=30)
-        chain = ticker.option_chain(expirations[0])
-
-        if action == "CALL":
-            df = chain.calls
-        elif action == "PUT":
-            df = chain.puts
+        # pick expiry closest to approx_expiry but >= approx_expiry if possible
+        target = pd.to_datetime(approx_expiry)
+        parsed = pd.to_datetime(expiries)
+        diffs = (parsed - target).days.values
+        # prefer non-negative diffs (future), else smallest absolute
+        idx = None
+        non_neg = np.where(diffs >= 0)[0]
+        if len(non_neg) > 0:
+            idx = non_neg[np.argmin(diffs[non_neg])]
         else:
-            return {"strike": None, "expiration_date": None, "purchase_cost": 0.0}
+            idx = int(np.argmin(np.abs(diffs)))
 
-        # Directional strike selection
-        if action == "CALL":
-            df_above = df[df["strike"] >= underlying_price]
-            if not df_above.empty:
-                opt = df_above.iloc[0]
-            else:
-                opt = df.iloc[df["strike"].idxmin()]
-        elif action == "PUT":
-            df_below = df[df["strike"] <= underlying_price]
-            if not df_below.empty:
-                opt = df_below.iloc[-1]
-            else:
-                opt = df.iloc[df["strike"].idxmin()]
-        else:
-            opt = df.iloc[df["strike"].idxmin()]
+        expiry_str = expiries[idx]
+        chain = tk.option_chain(expiry_str)
+        table = chain.calls if opt_type == "CALL" else chain.puts
+        if table is None or table.empty:
+            return None, None
 
-        # Midpoint of bid/ask
-        bid = opt.get("bid", np.nan)
-        ask = opt.get("ask", np.nan)
-        if not np.isnan(bid) and not np.isnan(ask) and (bid > 0 or ask > 0):
-            purchase_cost = float((bid + ask) / 2)
-        elif not np.isnan(bid) and bid > 0:
-            purchase_cost = float(bid)
-        elif not np.isnan(ask) and ask > 0:
-            purchase_cost = float(ask)
-        else:
-            purchase_cost = round(underlying_price * 0.05, 2)
+        # nearest strike row
+        table = table.dropna(subset=["strike"])
+        table["dist"] = np.abs(table["strike"] - strike)
+        row = table.loc[table["dist"].idxmin()] if "dist" in table.columns else None
+        if row is None:
+            return None, None
 
-        # Safety floor for stale data
-        if purchase_cost < 0.5:
-            purchase_cost = round(underlying_price * 0.03, 2)
+        # impliedVolatility is fraction (e.g., 0.32); typical Yahoo column name is 'impliedVolatility'
+        iv = float(row.get("impliedVolatility", np.nan))
+        if not np.isfinite(iv) or iv <= 0:
+            iv = None
 
-        return {
-            "strike": float(opt["strike"]),
-            "expiration_date": str(expiration_date.date()),
-            "purchase_cost": round(purchase_cost, 2),
-        }
+        # pick a reasonable strike increment from chain
+        # infer increment from unique sorted strikes
+        uniq = np.sort(table["strike"].unique())
+        inc = None
+        if len(uniq) >= 2:
+            inc = float(np.round(uniq[1] - uniq[0], 2))
 
+        expiry_date = pd.to_datetime(expiry_str).date()
+        return iv, inc or 1.0
     except Exception:
-        expiration_date = pd.Timestamp(date) + pd.Timedelta(days=30)
-        return {
-            "strike": round(underlying_price, 2),
-            "expiration_date": str(expiration_date.date()),
-            "purchase_cost": round(underlying_price * 0.05, 2),
-        }
+        return None, None
 
+# ------------------------------------------------------------
+# Core simulation (intraday open->close per day)
+# ------------------------------------------------------------
+def run_simulation(model_path: str, symbol: str, start: str, end: str, starting_balance: float = 10_000.0):
+    print(f"📈 Intraday simulation for {symbol} | model={model_path} | {start}→{end} | start_cash=${starting_balance:,.2f}")
 
-# ---------------------------------------------------------------------
-# Request model
-# ---------------------------------------------------------------------
-class SimRequest(BaseModel):
-    model_used: str
-    start_date: str
-    end_date: str
-    portfolio_start: float
-    symbol: str | None = None  # optional override
+    # Build env + vec
+    env_fn = make_env(symbol, start, end, full_run=True)
+    base_vec = DummyVecEnv([env_fn])
 
-
-# ---------------------------------------------------------------------
-# Main simulation logic
-# ---------------------------------------------------------------------
-def run_simulation(model_used: str, start_date: str, end_date: str, portfolio_start: float, symbol: str | None = None):
-    CONTRACT_MULTIPLIER = 100
-    COMMISSION_PER_CONTRACT = 0.65
-    LOOKBACK_DAYS = 30
-
-    # Determine trading symbol
-    if not symbol or symbol.strip() == "":
-        try:
-            parts = model_used.split("_")
-            symbol = parts[-1].upper()
-        except Exception:
-            raise ValueError("Invalid model name format. Expected something like 'ppo_agent_v1_AAPL'")
+    # load VecNormalize if present
+    vecnorm_path = str(model_path).replace(".zip", "_vecnorm.pkl")
+    if Path(vecnorm_path).exists():
+        print(f"🔄 Loading VecNormalize stats from {vecnorm_path}")
+        vec_env = VecNormalize.load(vecnorm_path, base_vec)
+        vec_env.training = False
+        vec_env.norm_reward = False
     else:
-        symbol = symbol.upper()
+        print("⚠️ No VecNormalize stats found, using fresh normalization (results may differ).")
+        vec_env = VecNormalize(base_vec, norm_obs=True, norm_reward=False, clip_obs=5.0)
 
-    model_path = MODELS_DIR / f"{model_used}.zip"
-    if not model_path.exists():
-        raise FileNotFoundError(f"Model not found: {model_path}")
+    # Load PPO
+    model = PPO.load(model_path, env=vec_env)
 
-    model = PPO.load(str(model_path))
+    # Get underlying data (already inside env)
+    env: OptionTradingEnv = base_vec.envs[0].env  # unwrap Monitor->OptionTradingEnv
+    df = env.df.copy()  # columns include Date, Open, Close, Volatility, etc.
 
-    # Create env with lookback
-    env = SimOptionTradingEnv(symbol=symbol, start=start_date, end=end_date, lookback_days=LOOKBACK_DAYS)
+    # Restrict to requested dates (env already did, but to be safe)
+    df["Date"] = pd.to_datetime(df["Date"]).dt.tz_localize(None)
+    start_dt = pd.to_datetime(start)
+    end_dt = pd.to_datetime(end)
+    mask = (df["Date"] >= start_dt) & (df["Date"] <= end_dt)
+    df = df.loc[mask].reset_index(drop=True)
 
-    portfolio = float(portfolio_start)
-    portfolio_history = [portfolio]
-    trade_log = []
-    per_trade_returns = []
+    if df.empty:
+        raise ValueError(f"No price rows in range {start}→{end} for {symbol}")
 
-    obs, _ = env.reset()
+    # ----------------------------------------------------------------
+    # DTE + Chain setup
+    # ----------------------------------------------------------------
+    rng = np.random.default_rng(seed=42)
+
+    # Target DTE ~33–40 days for all trades (constant-style rolling)
+    target_dte_days = int(33 + rng.integers(0, 8))
+
+    # Pick a proxy expiry date just for IV lookup (today + target_dte)
+    first_trade_day = pd.to_datetime(df["Date"].iloc[0]).date()
+    expiry_for_chain = first_trade_day + timedelta(days=target_dte_days)
+
+    # Infer strike increment and an IV proxy once from Yahoo chain
+    sample_S0 = float(df["Open"].iloc[0])
+    prelim_strike_call = choose_strike(sample_S0, "CALL", increment=1.0)
+    chain_iv, inferred_inc = load_chain_iv(symbol, expiry_for_chain, prelim_strike_call, "CALL")
+    strike_inc = inferred_inc if inferred_inc else 1.0
+
+    sigma_chain = chain_iv if (chain_iv and chain_iv > 0) else None
+    print(f"IV source: {'Yahoo chain' if sigma_chain else 'Env rolling vol'}; strike increment={strike_inc}")
+
+    # ----------------------------------------------------------------
+    # Simulation state
+    # ----------------------------------------------------------------
+    r = getattr(env, "r", 0.02)
+    cash = float(starting_balance)
+    portfolio_values = [cash]
+    trades = []
+
+    obs = vec_env.reset()
     done = False
-    step_count = 0
 
-    while not done:
-        action, _ = model.predict(obs, deterministic=True)
-        obs, reward, done, _, info = env.step(action)
+    for i in range(len(df)):
+        row = df.iloc[i]
+        day = pd.to_datetime(row["Date"]).date()
+        S_open = float(row["Open"])
+        S_close = float(row["Close"])
 
-        option_return = float(info.get("option_return", 0.0))
-        price_change = float(info.get("price_change", 0.0))
+        # --- Always open new trades with fresh ~33–40 DTE options ---
+        dte_days = int(33 + rng.integers(0, 8))
+        T_years_open = dte_days / 365.0
+        T_years_close = (dte_days - 1) / 365.0
 
-        row = env.df.iloc[env.current_step]
-        date_val = row["Date"]
-        if isinstance(date_val, pd.Series):
-            date_val = date_val.iloc[0]
-        trade_date = pd.to_datetime(date_val).date().isoformat()
+        if np.any(~np.isfinite(obs)):
+            raise ValueError(f"Invalid observation at step {i} (NaN/inf values)")
 
-        underlying_open = float(row["Open"])
-        underlying_close = float(row["Close"])
-        underlying_price = underlying_close
+        # ------------------------------------------------------------
+        # PPO Action Decision
+        # ------------------------------------------------------------
+        action_idx, _ = model.predict(obs, deterministic=True)
+        action_idx = int(action_idx)
+        action = "HOLD" if action_idx == 1 else ("PUT" if action_idx == 0 else "CALL")
 
-        action_name = ["PUT", "HOLD", "CALL"][int(action)]
+        # ------------------------------------------------------------
+        # Sigma (volatility) logic
+        # ------------------------------------------------------------
+        sigma_day = float(row.get("Volatility", np.nan))
+        if not np.isfinite(sigma_day) or sigma_day <= 0:
+            recent = df["Close"].pct_change().iloc[max(0, i - 20): i + 1].dropna()
+            sigma_day = float(recent.std() * np.sqrt(252)) if len(recent) >= 5 else 0.20
+        sigma_day = max(0.05, min(2.0, sigma_day))
 
-        portfolio_before = portfolio
-        contracts = 0
-        pnl = pnl_pct_of_port_before = 0.0
-        total_cost = total_proceeds = cost_per_contract = sale_price_per_contract = 0.0
-
-        if action_name in ("PUT", "CALL"):
-            opt_info = get_option_details(symbol, trade_date, action_name, underlying_price)
-            cost_per_contract = float(opt_info.get("purchase_cost", 0.0))
-
-            if cost_per_contract > 0:
-                unit_cost = cost_per_contract * CONTRACT_MULTIPLIER + COMMISSION_PER_CONTRACT
-                max_contracts = int(portfolio // unit_cost)
-            else:
-                max_contracts = 0
-
-            if max_contracts > 0:
-                contracts = max_contracts
-                total_cost = contracts * (cost_per_contract * CONTRACT_MULTIPLIER) + contracts * COMMISSION_PER_CONTRACT
-
-                sale_price_per_contract = cost_per_contract * (1.0 + option_return)
-                total_proceeds = contracts * (sale_price_per_contract * CONTRACT_MULTIPLIER) - contracts * COMMISSION_PER_CONTRACT
-
-                pnl = total_proceeds - total_cost
-                portfolio += pnl
-
-                if portfolio_before > 0:
-                    pnl_pct_of_port_before = pnl / portfolio_before
-                    per_trade_returns.append(pnl_pct_of_port_before)
-
-            trade_log.append({
-                "step": step_count,
-                "date": trade_date,
-                "action": action_name,
-                "strike_price": float(opt_info.get("strike")) if opt_info.get("strike") else None,
-                "expiration_date": opt_info.get("expiration_date"),
-                "purchase_cost": round(cost_per_contract, 2),
-                "contracts": contracts,
-                "total_cost": round(total_cost, 2),
-                "sale_price_per_contract": round(sale_price_per_contract, 2),
-                "total_proceeds": round(total_proceeds, 2),
-                "pnl": round(pnl, 2),
-                "pnl_pct": round(pnl_pct_of_port_before * 100, 3),
-                "underlying_open": round(underlying_open, 2),
-                "underlying_close": round(underlying_close, 2),
-                "price_change_pct": round(price_change * 100, 3),
-                "option_return_pct": round(option_return * 100, 3),
-                "portfolio_value": round(portfolio, 2),
-            })
+        if i == 0:
+            sigma_smoothed = sigma_day
         else:
-            trade_log.append({
-                "step": step_count,
-                "date": trade_date,
+            sigma_smoothed = 0.7 * sigma_smoothed + 0.3 * sigma_day
+
+        if sigma_chain and sigma_chain > 0.001:
+            sigma_open = sigma_close = float(0.5 * sigma_chain + 0.5 * sigma_smoothed)
+        else:
+            sigma_open = sigma_close = float(sigma_smoothed)
+
+        # ------------------------------------------------------------
+        # No trade (HOLD)
+        # ------------------------------------------------------------
+        if action == "HOLD":
+            next_obs, _, _, _ = vec_env.step(np.array([1]))
+            obs = next_obs
+            trades.append({
+                "date": str(day),
                 "action": "HOLD",
-                "strike_price": None,
-                "expiration_date": None,
-                "purchase_cost": 0.0,
+                "underlying_open": S_open,
+                "underlying_close": S_close,
+                "strike": None,
+                "option_open": None,
+                "option_close": None,
                 "contracts": 0,
                 "total_cost": 0.0,
-                "sale_price_per_contract": 0.0,
                 "total_proceeds": 0.0,
                 "pnl": 0.0,
                 "pnl_pct": 0.0,
-                "underlying_open": round(underlying_open, 2),
-                "underlying_close": round(underlying_close, 2),
-                "price_change_pct": round(price_change * 100, 3),
-                "option_return_pct": 0.0,
-                "portfolio_value": round(portfolio, 2),
+                "volatility": round(sigma_open, 6),
+                "dte": dte_days,
+                "portfolio_value": round(cash, 2),
             })
+            portfolio_values.append(cash)
+            if cash <= 0:
+                print(f"[INFO] Portfolio depleted on {day}")
+                break
+            continue
 
-        portfolio_history.append(portfolio)
-        step_count += 1
+        # ------------------------------------------------------------
+        # Active trade (PUT / CALL)
+        # ------------------------------------------------------------
+        strike = choose_strike(S_open, action, increment=strike_inc)
 
-    # Summary
-    portfolio_end = portfolio
-    total_trades = sum(1 for t in trade_log if t["contracts"] > 0)
+        opt_type = action.upper()
+        opt_open = max(0.05, black_scholes_price(S_open, strike, T_years_open, r, sigma_open, opt_type))
+        opt_close = max(0.05, black_scholes_price(S_close, strike, T_years_close, r, sigma_close, opt_type))
 
-    if per_trade_returns:
-        avg_trade_return_pct = np.mean(per_trade_returns) * 100
-        best_trade_return_pct = np.max(per_trade_returns) * 100
-        worst_trade_return_pct = np.min(per_trade_returns) * 100
-    else:
-        avg_trade_return_pct = best_trade_return_pct = worst_trade_return_pct = 0
+        unit_cost = opt_open * 100.0
+        contracts = int(floor(cash / unit_cost)) if unit_cost > 0 else 0
 
-    ph = np.array(portfolio_history)
-    peaks = np.maximum.accumulate(ph)
-    drawdowns = (peaks - ph) / peaks
-    max_drawdown_pct = np.max(drawdowns) * 100 if len(drawdowns) else 0
+        if contracts < 1:
+            next_obs, _, _, _ = vec_env.step(np.array([1]))
+            obs = next_obs
+            trades.append({
+                "date": str(day),
+                "action": "HOLD",
+                "underlying_open": S_open,
+                "underlying_close": S_close,
+                "strike": None,
+                "option_open": None,
+                "option_close": None,
+                "contracts": 0,
+                "total_cost": 0.0,
+                "total_proceeds": 0.0,
+                "pnl": 0.0,
+                "pnl_pct": 0.0,
+                "volatility": round(sigma_open, 6),
+                "dte": dte_days,
+                "portfolio_value": round(cash, 2),
+            })
+            portfolio_values.append(cash)
+            if cash <= 0:
+                print(f"[INFO] Portfolio depleted on {day}")
+                break
+            continue
 
-    summary = {
-        "model_used": model_used,
+        total_cost = unit_cost * contracts
+        cash -= total_cost
+        unit_proceeds = opt_close * 100.0
+        total_proceeds = unit_proceeds * contracts
+        cash += total_proceeds
+
+        pnl = total_proceeds - total_cost
+        pnl_pct = (pnl / total_cost * 100.0) if total_cost > 0 else 0.0
+
+        trades.append({
+            "date": str(day),
+            "action": action,
+            "underlying_open": S_open,
+            "underlying_close": S_close,
+            "strike": round(strike, 2),
+            "option_open": round(opt_open, 4),
+            "option_close": round(opt_close, 4),
+            "contracts": int(contracts),
+            "total_cost": round(total_cost, 2),
+            "total_proceeds": round(total_proceeds, 2),
+            "pnl": round(pnl, 2),
+            "pnl_pct": round(pnl_pct, 2),
+            "volatility": round(sigma_open, 6),
+            "dte": dte_days,
+            "portfolio_value": round(cash, 2),
+        })
+
+        portfolio_values.append(cash)
+
+        a_idx = 2 if action == "CALL" else 0
+        next_obs, _, _, _ = vec_env.step(np.array([a_idx]))
+        obs = next_obs
+
+        if cash <= 0:
+            print(f"[INFO] Portfolio depleted on {day}")
+            break
+        if i >= len(df) - 1:
+            print(f"[INFO] Reached end of data on {day}")
+            break
+
+    # ----------------------------------------------------------------
+    # Final results
+    # ----------------------------------------------------------------
+    result = {
         "symbol": symbol,
-        "start_date": start_date,
-        "end_date": end_date,
-        "portfolio_start": portfolio_start,
-        "portfolio_end": round(portfolio_end, 2),
-        "total_trades": int(total_trades),
-        "max_drawdown_pct": round(max_drawdown_pct, 2),
-        "avg_trade_return_pct": round(avg_trade_return_pct, 2),
-        "best_trade_return_pct": round(best_trade_return_pct, 2),
-        "worst_trade_return_pct": round(worst_trade_return_pct, 2),
+        "model_name": Path(model_path).stem,
+        "start": start,
+        "end": end,
+        "starting_balance": float(starting_balance),
+        "final_balance": float(cash),
+        "pnl": float(cash - starting_balance),
+        "pnl_pct": float((cash - starting_balance) / starting_balance * 100.0),
+        "portfolio_values": [float(v) for v in portfolio_values],
+        "trades": trades,
     }
 
-    return {"summary": summary, "trades": trade_log}
+    out_file = RESULTS_DIR / f"simulation_{symbol}.json"
+    with open(out_file, "w") as f:
+        json.dump(result, f, indent=2)
+
+    print(f"✅ Intraday simulation complete. Final=${cash:,.2f}. Results saved to {out_file}")
+    return result
 
 
-# ---------------------------------------------------------------------
-# API endpoint
-# ---------------------------------------------------------------------
-@app.post("/run-sim")
-async def run_sim(request: SimRequest):
+# ------------------------------------------------------------
+# API Routes
+# ------------------------------------------------------------
+@app.post("/simulate")
+def simulate(
+    symbol: str = Query(..., description="Trading symbol, e.g. AAPL"),
+    model_name: str = Query(..., description="Model filename (e.g., ppo_agent_v1_AAPL.zip)"),
+    start: str = Query("2020-01-01"),
+    end: str = Query("2025-01-01"),
+    starting_balance: float = Query(10_000.0),
+):
+    """Run an intraday (open→close) simulation across the date range."""
+    model_path = str(MODELS_DIR / model_name)
+    if not Path(model_path).exists():
+        return JSONResponse(content={"error": f"Model not found: {model_path}"}, status_code=404)
+
     try:
-        result = run_simulation(
-            model_used=request.model_used,
-            start_date=request.start_date,
-            end_date=request.end_date,
-            portfolio_start=request.portfolio_start,
-            symbol=request.symbol,
-        )
-        return result
+        result = run_simulation(model_path, symbol.upper(), start, end, starting_balance)
+        return JSONResponse(content=result)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print("[ERROR]", e)
+        traceback.print_exc()
+        return JSONResponse(content={"error": str(e)}, status_code=500)
 
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8002)
+@app.get("/results")
+def list_results():
+    files = [f.name for f in RESULTS_DIR.glob("simulation_*.json")]
+    return {"results": files}

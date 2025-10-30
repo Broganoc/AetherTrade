@@ -1,6 +1,6 @@
 <template>
   <div class="p-6 min-h-screen">
-    <h2 class="text-xl font-semibold mb-4 dark:text-gray-100">Training Data</h2>
+    <h2 class="text-xl font-semibold mb-4 dark:text-gray-100">Training Dashboard</h2>
 
     <!-- Symbol input & buttons -->
     <div class="mb-4 flex items-center gap-2">
@@ -11,13 +11,7 @@
         class="px-3 py-2 border rounded dark:bg-gray-700 dark:text-gray-100"
       />
       <datalist id="symbols-list">
-        <option
-          v-for="symbol in symbols"
-          :key="symbol"
-          :value="symbol"
-        >
-          {{ symbol }}
-        </option>
+        <option v-for="symbol in symbols" :key="symbol" :value="symbol">{{ symbol }}</option>
       </datalist>
 
       <button
@@ -47,7 +41,15 @@
           {{ trainingProgress }}%
         </div>
       </div>
-      <div class="text-sm text-blue-400 mt-1">{{ trainingStatus }}</div>
+      <div class="text-sm mt-1 text-blue-400 dark:text-blue-300">
+        {{ trainingStatus }}
+        <span
+          v-if="meanReward !== null && meanEpLength !== null"
+          class="ml-2 text-xs text-gray-500 dark:text-gray-400"
+        >
+          (Mean Reward: {{ meanReward.toFixed(2) }}, Ep Len: {{ meanEpLength.toFixed(2) }})
+        </span>
+      </div>
     </div>
 
     <!-- Models Grid -->
@@ -60,44 +62,86 @@
       >
         <div class="flex justify-between items-center">
           <h3 class="font-semibold text-gray-800 dark:text-gray-100">
-            {{ model.model_name + " " + model.symbol }}
+            {{ model.model_name }} — {{ model.symbol }}
           </h3>
           <span class="text-sm text-gray-500 dark:text-gray-400">{{ model.trained_on }}</span>
         </div>
 
-        <p class="text-sm text-gray-600 dark:text-gray-300">Framework: {{ model.framework }}</p>
-        <p v-if="model.metrics.mean_reward !== null" class="text-sm text-gray-600 dark:text-gray-300">
-          Mean Reward: {{ model.metrics.mean_reward.toFixed(4) }}
-        </p>
-        <p v-if="model.metrics.mean_episode_length !== null" class="text-sm text-gray-600 dark:text-gray-300">
-          Mean Episode Length: {{ model.metrics.mean_episode_length.toFixed(2) }}
+        <p class="text-sm text-gray-600 dark:text-gray-300">
+          Framework: {{ model.framework }}
         </p>
 
-        <div
-          v-if="model.expanded"
-          class="mt-3 border-t border-gray-200 dark:border-gray-700 pt-2 text-sm text-gray-700 dark:text-gray-300"
+        <!-- Mean Reward -->
+        <p class="text-sm text-gray-600 dark:text-gray-300">
+          Mean Reward:
+          {{
+            model.metrics?.mean_reward !== null && model.metrics?.mean_reward !== undefined
+              ? model.metrics.mean_reward.toFixed(4)
+              : model.validation_mean_reward !== undefined
+                ? model.validation_mean_reward.toFixed(4)
+                : model.mean_reward !== undefined
+                  ? model.mean_reward.toFixed(4)
+                  : "N/A"
+          }}
+        </p>
+
+        <!-- Validation Mean Reward (if available) -->
+        <p
+          v-if="model.validation_mean_reward !== undefined"
+          class="text-sm text-gray-600 dark:text-gray-300"
         >
-          <p><strong>Path:</strong> {{ model.path }}</p>
-          <p><strong>Metrics:</strong></p>
-          <ul>
-            <li>
-              Mean Reward:
-              {{
-                model.metrics.mean_reward !== null
-                  ? model.metrics.mean_reward.toFixed(4)
-                  : "N/A"
-              }}
-            </li>
-            <li>
-              Mean Episode Length:
-              {{
-                model.metrics.mean_episode_length !== null
-                  ? model.metrics.mean_episode_length.toFixed(2)
-                  : "N/A"
-              }}
-            </li>
-          </ul>
-        </div>
+          Validation Mean Reward: {{ model.validation_mean_reward.toFixed(4) }}
+        </p>
+
+        <!-- Mean Episode Length -->
+        <p class="text-sm text-gray-600 dark:text-gray-300">
+          Mean Episode Length:
+          {{
+            model.metrics?.mean_episode_length !== null && model.metrics?.mean_episode_length !== undefined
+              ? model.metrics.mean_episode_length.toFixed(2)
+              : model.mean_episode_length !== undefined
+                ? model.mean_episode_length.toFixed(2)
+                : "N/A"
+          }}
+        </p>
+
+        <!-- Expanded view -->
+        <transition name="fade">
+          <div
+            v-if="model.expanded"
+            class="mt-3 border-t border-gray-200 dark:border-gray-700 pt-2 text-sm text-gray-700 dark:text-gray-300"
+          >
+            <p><strong>Path:</strong> {{ model.path }}</p>
+            <p><strong>Metrics:</strong></p>
+            <ul class="mt-2 space-y-1">
+              <li>
+                Mean Reward:
+                {{
+                  model.metrics?.mean_reward !== null && model.metrics?.mean_reward !== undefined
+                    ? model.metrics.mean_reward.toFixed(4)
+                    : model.validation_mean_reward !== undefined
+                      ? model.validation_mean_reward.toFixed(4)
+                      : model.mean_reward !== undefined
+                        ? model.mean_reward.toFixed(4)
+                        : "N/A"
+                }}
+              </li>
+              <li v-if="model.validation_mean_reward !== undefined">
+                Validation Mean Reward: {{ model.validation_mean_reward.toFixed(4) }}
+              </li>
+              <li>
+                Mean Episode Length:
+                {{
+                  model.metrics?.mean_episode_length !== null && model.metrics?.mean_episode_length !== undefined
+                    ? model.metrics.mean_episode_length.toFixed(2)
+                    : model.mean_episode_length !== undefined
+                      ? model.mean_episode_length.toFixed(2)
+                      : "N/A"
+                }}
+              </li>
+            </ul>
+          </div>
+        </transition>
       </div>
     </div>
   </div>
@@ -115,15 +159,15 @@ export default {
       symbols: ["AAPL", "TSLA", "MSFT", "GOOG", "AMZN"],
       eventSource: null,
       isTraining: false,
+      meanReward: null,
+      meanEpLength: null,
     };
   },
   created() {
     this.fetchModels();
   },
   beforeUnmount() {
-    if (this.eventSource) {
-      this.eventSource.close();
-    }
+    if (this.eventSource) this.eventSource.close();
   },
   methods: {
     async fetchModels() {
@@ -138,18 +182,17 @@ export default {
     toggleExpanded(index) {
       this.models[index].expanded = !this.models[index].expanded;
     },
-
     async runTraining() {
       if (!this.selectedSymbol) {
         this.trainingStatus = "Please enter a stock symbol!";
         return;
       }
-
       this.isTraining = true;
       this.trainingProgress = 0;
-      this.trainingStatus = "Training started...";
+      this.trainingStatus = `Training started for ${this.selectedSymbol}...`;
+      this.meanReward = null;
+      this.meanEpLength = null;
 
-      // Create SSE connection
       const url = `http://localhost:8001/train_stream?symbol=${this.selectedSymbol}`;
       this.eventSource = new EventSource(url);
 
@@ -158,19 +201,22 @@ export default {
 
         if (data.status === "started") {
           this.trainingProgress = 0;
-          this.trainingStatus = `Training started for ${data.symbol}`;
+          this.trainingStatus = `Training started for ${data.symbols?.join(", ") || this.selectedSymbol}`;
         } else if (data.status === "training") {
-          this.trainingProgress = data.progress;
-          this.trainingStatus = `Training ${data.symbol}: ${data.progress}% complete`;
+          this.trainingProgress = data.progress || 0;
+          this.meanReward = data.mean_reward ?? null;
+          this.meanEpLength = data.mean_episode_length ?? null;
+          this.trainingStatus = `Training ${data.symbols?.join(", ") || this.selectedSymbol}: ${data.progress}%`;
         } else if (data.status === "completed") {
           this.trainingProgress = 100;
-          this.trainingStatus = `✅ Training completed for ${data.symbol}`;
+          this.trainingStatus = `✅ Training completed for ${data.symbols?.join(", ") || this.selectedSymbol}`;
+          this.meanReward = data.val_mean ?? this.meanReward;
           this.isTraining = false;
 
           setTimeout(() => {
             this.trainingStatus = "";
             this.trainingProgress = 0;
-            this.fetchModels(); // refresh models
+            this.fetchModels();
           }, 1500);
 
           this.eventSource.close();
@@ -188,22 +234,18 @@ export default {
         }
       };
     },
-
     async cancelTraining() {
       if (this.eventSource) {
         this.eventSource.close();
         this.eventSource = null;
       }
-
       this.isTraining = false;
       this.trainingStatus = "❌ Training cancelled.";
-
       try {
         await fetch("http://localhost:8001/training_status", { method: "DELETE" });
       } catch (err) {
         console.error("Failed to cancel training:", err);
       }
-
       setTimeout(() => {
         this.trainingProgress = 0;
         this.trainingStatus = "";
@@ -214,7 +256,12 @@ export default {
 </script>
 
 <style scoped>
-.disabled\:opacity-50 {
-  opacity: 0.5;
+.fade-enter-active,
+.fade-leave-active {
+  transition: opacity 0.2s ease;
+}
+.fade-enter-from,
+.fade-leave-to {
+  opacity: 0;
 }
 </style>

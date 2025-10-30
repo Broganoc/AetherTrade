@@ -4,7 +4,7 @@
 
     <!-- Simulation Form -->
     <div class="bg-gray-100 dark:bg-gray-800 p-6 rounded-lg shadow mb-6 relative z-10">
-      <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4">
+      <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-6 gap-4">
         <!-- Model -->
         <div>
           <label class="block text-sm font-medium mb-1 dark:text-gray-200">Model</label>
@@ -19,33 +19,14 @@
           </select>
         </div>
 
-        <!-- Symbol Search -->
-        <div class="relative">
+        <!-- Symbol -->
+        <div>
           <label class="block text-sm font-medium mb-1 dark:text-gray-200">Symbol</label>
           <input
-            type="text"
             v-model="symbol"
-            @input="filterSymbols"
-            @focus="showSuggestions = true"
-            @blur="hideSuggestions"
-            placeholder="Search or type symbol (e.g. AAPL, SPY, NASDAQ)"
+            placeholder="e.g. AAPL"
             class="w-full p-2 border rounded bg-white dark:bg-gray-700 dark:text-gray-200 uppercase"
-            autocomplete="off"
           />
-          <ul
-            v-if="showSuggestions && filteredSymbolList.length"
-            class="absolute z-50 w-full bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded mt-1 max-h-48 overflow-y-auto shadow-lg"
-          >
-            <li
-              v-for="item in filteredSymbolList"
-              :key="item.symbol"
-              @mousedown.prevent="selectSymbol(item.symbol)"
-              class="px-3 py-2 cursor-pointer hover:bg-gray-100 dark:hover:bg-gray-700 flex justify-between"
-            >
-              <span class="font-medium">{{ item.symbol }}</span>
-              <span class="text-xs text-gray-500 dark:text-gray-400">{{ item.name }}</span>
-            </li>
-          </ul>
         </div>
 
         <!-- Dates -->
@@ -66,12 +47,14 @@
           />
         </div>
 
-        <!-- Portfolio -->
+        <!-- Starting Balance -->
         <div>
-          <label class="block text-sm font-medium mb-1 dark:text-gray-200">Starting Portfolio ($)</label>
+          <label class="block text-sm font-medium mb-1 dark:text-gray-200">Starting Balance ($)</label>
           <input
             type="number"
-            v-model.number="portfolioStart"
+            v-model.number="startingBalance"
+            min="1"
+            step="1"
             class="w-full p-2 border rounded bg-white dark:bg-gray-700 dark:text-gray-200"
           />
         </div>
@@ -88,30 +71,53 @@
       </button>
     </div>
 
-    <!-- Summary -->
+    <!-- Simulation Summary -->
     <div
-      v-if="simulatorData"
-      class="bg-white dark:bg-gray-800 p-6 rounded-lg shadow mb-6 relative z-10"
+      v-if="simResult"
+      class="bg-white dark:bg-gray-800 p-6 rounded-lg shadow relative z-10"
     >
-      <h3 class="text-lg font-semibold mb-2 dark:text-gray-100">Simulation Summary</h3>
+      <h3 class="text-lg font-semibold mb-4 dark:text-gray-100">Simulation Summary</h3>
+
       <div class="grid grid-cols-1 md:grid-cols-3 gap-2 text-sm dark:text-gray-200">
-        <p><strong>Model Used:</strong> {{ simulatorData.model_used }}</p>
-        <p><strong>Symbol:</strong> {{ simulatorData.symbol }}</p>
-        <p><strong>Date Range:</strong> {{ simulatorData.start_date }} → {{ simulatorData.end_date }}</p>
-        <p><strong>Portfolio Start:</strong> ${{ simulatorData.portfolio_start.toLocaleString() }}</p>
-        <p><strong>Portfolio End:</strong> ${{ simulatorData.portfolio_end.toLocaleString() }}</p>
-        <p><strong>Total Trades:</strong> {{ simulatorData.total_trades }}</p>
-        <p><strong>Max Drawdown:</strong> {{ simulatorData.max_drawdown_pct }}%</p>
-        <p><strong>Avg Trade Return:</strong> {{ simulatorData.avg_trade_return_pct }}%</p>
-        <p><strong>Best Trade:</strong> {{ simulatorData.best_trade_return_pct }}%</p>
-        <p><strong>Worst Trade:</strong> {{ simulatorData.worst_trade_return_pct }}%</p>
+        <p><strong>Symbol:</strong> {{ simResult.symbol }}</p>
+        <p><strong>Model:</strong> {{ selectedModel }}</p>
+        <p><strong>Start:</strong> {{ simResult.start }}</p>
+        <p><strong>End:</strong> {{ simResult.end }}</p>
+        <p><strong>Starting Balance:</strong> ${{ numberFmt(simResult.starting_balance) }}</p>
+        <p><strong>Final Balance:</strong> ${{ numberFmt(simResult.final_balance) }}</p>
+        <p>
+          <strong>P&L:</strong>
+          <span :class="pnl >= 0 ? 'text-green-600' : 'text-red-600'">
+            ${{ numberFmt(pnl) }} ({{ simResult.pnl_pct.toFixed(2) }}%)
+          </span>
+        </p>
+      </div>
+
+      <!-- Portfolio Chart -->
+      <div class="mt-6">
+        <h4 class="font-semibold text-sm dark:text-gray-200 mb-2">Portfolio Value Over Time</h4>
+        <div class="w-full overflow-hidden border border-gray-200 dark:border-gray-700 rounded">
+          <svg :viewBox="`0 0 ${chartWidth} ${chartHeight}`" class="w-full h-48">
+            <path
+              v-if="portfolioPath"
+              :d="portfolioPath"
+              fill="none"
+              stroke="currentColor"
+              class="text-blue-600 dark:text-blue-400"
+              stroke-width="2"
+            />
+          </svg>
+        </div>
+        <div class="text-xs text-gray-500 dark:text-gray-400 mt-1">
+          Min: ${{ numberFmt(minPortfolio) }} &nbsp;|&nbsp; Max: ${{ numberFmt(maxPortfolio) }}
+        </div>
       </div>
     </div>
 
     <!-- Trade Log Table -->
     <div
-      v-if="trades.length"
-      class="bg-white dark:bg-gray-800 p-6 rounded-lg shadow relative z-10"
+      v-if="flattenedTrades.length"
+      class="bg-white dark:bg-gray-800 p-6 rounded-lg shadow relative z-10 mt-6"
     >
       <div class="flex flex-col md:flex-row md:items-center md:justify-between mb-4 gap-2">
         <h3 class="text-lg font-semibold dark:text-gray-100">Trade Log</h3>
@@ -142,41 +148,57 @@
         </div>
       </div>
 
-      <!-- Table -->
       <div class="overflow-x-auto">
-        <table class="min-w-full text-sm border-collapse border border-gray-300 dark:border-gray-700">
+        <table class="min-w-full text-xs border-collapse border border-gray-300 dark:border-gray-700">
           <thead class="bg-gray-200 dark:bg-gray-700 text-gray-800 dark:text-gray-100">
             <tr>
-              <th v-for="header in tableHeaders" :key="header" class="px-3 py-2 border border-gray-300 dark:border-gray-700">
-                {{ header }}
-              </th>
+              <th class="px-3 py-2 border">Date</th>
+              <th class="px-3 py-2 border">Action</th>
+              <th class="px-3 py-2 border">Open ($)</th>
+              <th class="px-3 py-2 border">Close ($)</th>
+              <th class="px-3 py-2 border">Strike ($)</th>
+              <th class="px-3 py-2 border">Opt Open ($)</th>
+              <th class="px-3 py-2 border">Opt Close ($)</th>
+              <th class="px-3 py-2 border">Contracts</th>
+              <th class="px-3 py-2 border">Cost ($)</th>
+              <th class="px-3 py-2 border">Proceeds ($)</th>
+              <th class="px-3 py-2 border">P&L ($)</th>
+              <th class="px-3 py-2 border">P&L (%)</th>
+              <th class="px-3 py-2 border">σ</th>
+              <th class="px-3 py-2 border">DTE</th>
+              <th class="px-3 py-2 border">Portfolio ($)</th>
             </tr>
           </thead>
           <tbody>
             <tr
-              v-for="trade in filteredTrades"
-              :key="trade.step"
+              v-for="row in filteredTrades"
+              :key="row._key"
               class="border-t border-gray-300 dark:border-gray-700 hover:opacity-90 transition-colors"
               :class="{
-                'bg-green-100 dark:bg-green-900/25': trade.pnl_pct > 0,
-                'bg-red-100 dark:bg-red-900/25': trade.pnl_pct < 0
+                'bg-green-50 dark:bg-green-900/20': row.action === 'CALL',
+                'bg-red-50 dark:bg-red-900/20': row.action === 'PUT',
               }"
             >
-              <td class="px-3 py-1 text-center">{{ trade.step }}</td>
-              <td class="px-3 py-1 text-center">{{ formatDate(trade.date) }}</td>
-              <td class="px-3 py-1 text-center">{{ trade.action }}</td>
-              <td class="px-3 py-1 text-center">{{ trade.underlying_open ? `$${trade.underlying_open.toFixed(2)}` : "-" }}</td>
-              <td class="px-3 py-1 text-center font-semibold">{{ trade.underlying_close ? `$${trade.underlying_close.toFixed(2)}` : "-" }}</td>
-              <td class="px-3 py-1 text-center">{{ trade.strike_price ? `$${trade.strike_price.toFixed(2)}` : "-" }}</td>
-              <td class="px-3 py-1 text-center">{{ trade.expiration_date || "-" }}</td>
-              <td class="px-3 py-1 text-center">{{ trade.purchase_cost ? `$${trade.purchase_cost.toFixed(2)}` : "-" }}</td>
-              <td class="px-3 py-1 text-center">{{ trade.contracts || "-" }}</td>
-              <td class="px-3 py-1 text-center">{{ trade.total_cost ? `$${trade.total_cost.toLocaleString()}` : "-" }}</td>
-              <td class="px-3 py-1 text-center">{{ trade.sale_price_per_contract ? `$${trade.sale_price_per_contract.toFixed(2)}` : "-" }}</td>
-              <td class="px-3 py-1 text-center">{{ trade.total_proceeds ? `$${trade.total_proceeds.toLocaleString()}` : "-" }}</td>
-              <td class="px-3 py-1 text-center font-semibold">{{ trade.pnl ? `$${trade.pnl.toFixed(2)}` : "-" }}</td>
-              <td class="px-3 py-1 text-center font-semibold">{{ trade.pnl_pct ? `${trade.pnl_pct.toFixed(2)}%` : "-" }}</td>
-              <td class="px-3 py-1 text-center">${{ trade.portfolio_value.toLocaleString() }}</td>
+              <td class="px-3 py-1 text-center">{{ row.date }}</td>
+              <td class="px-3 py-1 text-center font-semibold">{{ row.action }}</td>
+              <td class="px-3 py-1 text-center">{{ numberFmt(row.underlying_open) }}</td>
+              <td class="px-3 py-1 text-center">{{ numberFmt(row.underlying_close) }}</td>
+              <td class="px-3 py-1 text-center">{{ row.strike ?? '-' }}</td>
+              <td class="px-3 py-1 text-center">{{ row.option_open ?? '-' }}</td>
+              <td class="px-3 py-1 text-center">{{ row.option_close ?? '-' }}</td>
+              <td class="px-3 py-1 text-center">{{ row.contracts }}</td>
+              <td class="px-3 py-1 text-center">{{ numberFmt(row.total_cost) }}</td>
+              <td class="px-3 py-1 text-center">{{ numberFmt(row.total_proceeds) }}</td>
+              <td
+                class="px-3 py-1 text-center font-semibold"
+                :class="row.pnl >= 0 ? 'text-green-600' : 'text-red-600'"
+              >
+                {{ numberFmt(row.pnl) }}
+              </td>
+              <td class="px-3 py-1 text-center">{{ row.pnl_pct?.toFixed?.(2) ?? '-' }}</td>
+              <td class="px-3 py-1 text-center">{{ row.volatility?.toFixed?.(3) ?? '-' }}</td>
+              <td class="px-3 py-1 text-center">{{ row.dte ?? '-' }}</td>
+              <td class="px-3 py-1 text-center font-semibold">{{ numberFmt(row.portfolio_value) }}</td>
             </tr>
           </tbody>
         </table>
@@ -210,137 +232,127 @@ export default {
       models: [],
       selectedModel: "",
       symbol: "",
-      startDate: "",
-      endDate: "",
-      portfolioStart: 100000,
-      simulatorData: null,
-      trades: [],
+      startDate: "2020-01-01",
+      endDate: "2025-01-01",
+      startingBalance: 10000,
+      simResult: null,
       validationError: "",
       isRunning: false,
       filterAction: "",
       searchText: "",
-      showSuggestions: false,
-      filteredSymbolList: [],
-      symbolList: [],
-      tableHeaders: [
-        "Step", "Date", "Action", "Underlying Open ($)", "Underlying Close ($)",
-        "Strike ($)", "Expiration", "Cost ($)", "Contracts", "Total Cost ($)",
-        "Sale Price ($)", "Total Proceeds ($)", "P&L ($)", "P&L (%)", "Portfolio ($)"
-      ]
+      chartWidth: 800,
+      chartHeight: 200,
+      padding: 24,
     };
-  },
-  computed: {
-    filteredTrades() {
-      return this.trades.filter((t) => {
-        const matchesAction = !this.filterAction || t.action === this.filterAction;
-        const text = this.searchText.toLowerCase();
-        const matchesSearch =
-          !text ||
-          t.date?.toLowerCase().includes(text) ||
-          String(t.strike_price || "").toLowerCase().includes(text);
-        return matchesAction && matchesSearch;
-      });
-    },
   },
   created() {
     this.fetchModels();
-    this.loadSymbols();
+    this.$nextTick(() => {
+      const resize = () => {
+        const el = this.$el.querySelector("svg");
+        if (el && el.clientWidth) this.chartWidth = Math.max(400, el.clientWidth);
+      };
+      window.addEventListener("resize", resize);
+      resize();
+      this._resize = resize;
+    });
+  },
+  beforeUnmount() {
+    if (this._resize) window.removeEventListener("resize", this._resize);
+  },
+  computed: {
+    pnl() {
+      if (!this.simResult) return 0;
+      return this.simResult.final_balance - this.simResult.starting_balance;
+    },
+    flattenedTrades() {
+      return (this.simResult?.trades || []).map((t, i) => ({
+        _key: `${t.date}-${i}`,
+        ...t,
+      }));
+    },
+    filteredTrades() {
+      const text = this.searchText.trim().toLowerCase();
+      return this.flattenedTrades.filter((r) => {
+        const a = !this.filterAction || r.action === this.filterAction;
+        const s =
+          !text ||
+          String(r.date).toLowerCase().includes(text) ||
+          String(r.strike ?? "").toLowerCase().includes(text);
+        return a && s;
+      });
+    },
+    minPortfolio() {
+      const vals = this.simResult?.portfolio_values || [];
+      return vals.length ? Math.min(...vals) : this.startingBalance;
+    },
+    maxPortfolio() {
+      const vals = this.simResult?.portfolio_values || [];
+      return vals.length ? Math.max(...vals) : this.startingBalance;
+    },
+    portfolioPath() {
+      const vals = this.simResult?.portfolio_values || [];
+      if (!vals.length) return "";
+      const w = this.chartWidth,
+        h = this.chartHeight,
+        pad = this.padding;
+      const xScale = (i) => pad + (i * (w - 2 * pad)) / (vals.length - 1);
+      const minV = this.minPortfolio,
+        maxV = this.maxPortfolio,
+        range = maxV - minV || 1;
+      const yScale = (v) => h - pad - ((v - minV) / range) * (h - 2 * pad);
+      let d = `M ${xScale(0)} ${yScale(vals[0])}`;
+      for (let i = 1; i < vals.length; i++) d += ` L ${xScale(i)} ${yScale(vals[i])}`;
+      return d;
+    },
   },
   methods: {
-    async loadSymbols() {
-      try {
-        const res = await fetch("/src/data/symbols.json");
-        if (!res.ok) throw new Error("Failed to load symbols.json");
-        this.symbolList = await res.json();
-        this.filteredSymbolList = this.symbolList.slice(0, 8);
-      } catch (err) {
-        console.warn("Falling back to default symbols:", err);
-        this.symbolList = [
-          { symbol: "AAPL", name: "Apple Inc." },
-          { symbol: "MSFT", name: "Microsoft Corp." },
-          { symbol: "SPY", name: "S&P 500 ETF" },
-          { symbol: "^IXIC", name: "NASDAQ Composite Index" },
-          { symbol: "^DJI", name: "Dow Jones Industrial Average" }
-        ];
-      }
-    },
-    filterSymbols() {
-      const q = this.symbol.trim().toUpperCase();
-      this.filteredSymbolList = this.symbolList.filter(
-        (s) => s.symbol.includes(q) || s.name.toUpperCase().includes(q)
-      ).slice(0, 10);
-    },
-    selectSymbol(sym) {
-      this.symbol = sym.toUpperCase();
-      this.showSuggestions = false;
-    },
-    hideSuggestions() {
-      setTimeout(() => (this.showSuggestions = false), 150);
+    numberFmt(n) {
+      return Number(n ?? 0).toLocaleString(undefined, { maximumFractionDigits: 2 });
     },
     async fetchModels() {
-      try {
-        const res = await fetch("http://localhost:8001/models");
-        this.models = await res.json();
-      } catch (err) {
-        console.error("Failed to fetch models:", err);
-      }
+      const res = await fetch("http://localhost:8001/models");
+      this.models = await res.json();
     },
     async runSimulation() {
       this.validationError = "";
-      if (!this.selectedModel || !this.startDate || !this.endDate) {
-        this.validationError = "Please fill out all fields.";
+      if (!this.selectedModel || !this.symbol) {
+        this.validationError = "Please select a model and symbol.";
         return;
       }
       this.isRunning = true;
+      this.simResult = null;
       try {
-        const res = await fetch("http://localhost:8002/run-sim", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            model_used: this.selectedModel,
-            start_date: this.startDate,
-            end_date: this.endDate,
-            portfolio_start: this.portfolioStart,
-            symbol: this.symbol
-          })
-        });
-        if (!res.ok) {
-          const err = await res.json();
-          throw new Error(err.detail || "Simulation failed");
-        }
-        const data = await res.json();
-        this.simulatorData = data.summary;
-        this.trades = data.trades || [];
+        const url = new URL("http://localhost:8002/simulate");
+        url.searchParams.set("symbol", this.symbol.toUpperCase());
+        url.searchParams.set("model_name", `${this.selectedModel}.zip`);
+        url.searchParams.set("start", this.startDate);
+        url.searchParams.set("end", this.endDate);
+        url.searchParams.set("starting_balance", this.startingBalance);
+        const res = await fetch(url, { method: "POST" });
+        if (!res.ok) throw new Error((await res.json()).error || "Simulation failed");
+        this.simResult = await res.json();
       } catch (err) {
-        console.error("Simulation failed:", err);
-        this.validationError = err.message || "Simulation failed. Check backend logs.";
+        this.validationError = err.message;
       } finally {
         this.isRunning = false;
       }
     },
-    formatDate(d) {
-      const date = new Date(d);
-      if (isNaN(date)) return d;
-      return date.toLocaleDateString("en-US", { year: "numeric", month: "short", day: "numeric" });
-    },
     downloadCSV() {
-      if (!this.trades.length) return;
-      const headers = Object.keys(this.trades[0]);
-      const csvRows = [
+      if (!this.flattenedTrades.length) return;
+      const headers = Object.keys(this.flattenedTrades[0]).filter((h) => !h.startsWith("_"));
+      const csv = [
         headers.join(","),
-        ...this.trades.map((t) => headers.map((h) => JSON.stringify(t[h] ?? "")).join(","))
-      ];
-      const blob = new Blob([csvRows.join("\n")], { type: "text/csv" });
-      const url = URL.createObjectURL(blob);
+        ...this.flattenedTrades.map((r) => headers.map((h) => r[h] ?? "").join(",")),
+      ].join("\n");
+      const blob = new Blob([csv], { type: "text/csv" });
       const link = document.createElement("a");
-      link.href = url;
-      link.download = `${this.selectedModel}_trade_log.csv`;
-      document.body.appendChild(link);
+      link.href = URL.createObjectURL(blob);
+      link.download = `${this.selectedModel}_${this.symbol}_trades.csv`;
       link.click();
-      document.body.removeChild(link);
-      URL.revokeObjectURL(url);
-    }
-  }
+      URL.revokeObjectURL(link.href);
+    },
+  },
 };
 </script>
 
@@ -354,6 +366,6 @@ export default {
   opacity: 0;
 }
 tr:hover {
-  filter: brightness(0.95);
+  filter: brightness(0.97);
 }
 </style>
