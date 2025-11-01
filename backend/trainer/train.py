@@ -1,49 +1,57 @@
-import json, redis, os
+import json, os, time, redis, asyncio, tempfile
 from pathlib import Path
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 from typing import List, Union
+
 import numpy as np
 import gymnasium as gym
+import torch
 
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.callbacks import CheckpointCallback
 from stable_baselines3.common.evaluation import evaluate_policy
 
 from shared.env import OptionTradingEnv
-
 
 # ======================================================
 # Persistent paths (Docker-mounted)
 # ======================================================
 MODELS_DIR = Path("/app/models")
 LOGS_DIR = Path("/app/logs")
+STATUS_FILE = Path("/app/status.json")
+
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
-r = redis.Redis(host=os.getenv("REDIS_HOST", "aethertrade_redis"), port=6379)
+r = redis.Redis(host=os.getenv("REDIS_HOST", "aethertrade_redis"), port=6379, db=0)
+
+# ======================================================
+# Utility helpers
+# ======================================================
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def write_status(data: dict):
-    data["last_update"] = datetime.now().isoformat()
-    r.set("training_status", json.dumps(data))
+    """Persist status to Redis and a JSON file."""
+    payload = {**data, "last_update": _utc_now_iso()}
+    try:
+        r.set("training_status", json.dumps(payload))
+    except Exception:
+        pass
+    try:
+        STATUS_FILE.write_text(json.dumps(payload, indent=2))
+    except Exception:
+        pass
 
 
 def compute_model_stats(model):
-    """
-    Compute average episode reward and length, even if VecNormalize wraps Monitor.
-    Always returns numeric values (never None).
-    """
     rewards, lengths = [], []
-
-    # Try PPO's built-in episode buffer
     for ep in getattr(model, "ep_info_buffer", []):
         if isinstance(ep, dict):
             rewards.append(ep.get("r", 0))
             lengths.append(ep.get("l", 0))
-
-    # Try VecNormalize → Monitor chain
     if not rewards:
         try:
             vec_env = model.get_env()
@@ -55,22 +63,16 @@ def compute_model_stats(model):
                         lengths.extend(e.episode_lengths)
         except Exception:
             pass
-
-    # Fallback defaults to avoid None
     if not rewards:
         rewards = [0.0]
     if not lengths:
         lengths = [1.0]
+    return {
+        "mean_reward": float(np.mean(rewards)),
+        "mean_episode_length": float(np.mean(lengths)),
+    }
 
-    mean_reward = float(np.mean(rewards))
-    mean_length = float(np.mean(lengths))
 
-    return {"mean_reward": mean_reward, "mean_episode_length": mean_length}
-
-
-# ======================================================
-# Env factory
-# ======================================================
 def make_env(symbol: str, start="2015-01-01", end="2025-01-01"):
     def _init():
         try:
@@ -78,124 +80,152 @@ def make_env(symbol: str, start="2015-01-01", end="2025-01-01"):
             return Monitor(env)
         except Exception as e:
             print(f"[WARN] Skipping {symbol}: {e}")
-
-            # Fallback dummy env if data fetch fails
             from gymnasium import spaces
 
             class DummyEnv(gym.Env):
                 observation_space = spaces.Box(low=-1, high=1, shape=(49,), dtype=np.float32)
                 action_space = spaces.Discrete(3)
-
-                def reset(self, **kwargs):
-                    return np.zeros(49, dtype=np.float32), {}
-
-                def step(self, action):
-                    return np.zeros(49, dtype=np.float32), 0.0, True, False, {}
+                def reset(self, **kwargs): return np.zeros(49, dtype=np.float32), {}
+                def step(self, action): return np.zeros(49, dtype=np.float32), 0.0, True, False, {}
 
             return Monitor(DummyEnv())
-
     return _init
 
 
 def _parse_symbols(symbol: Union[str, List[str]]) -> List[str]:
-    """Support comma-separated or list input."""
     if isinstance(symbol, list):
         return [s.strip().upper() for s in symbol if s.strip()]
     if isinstance(symbol, str):
-        parts = [p.strip().upper() for p in symbol.split(",")]
-        return [p for p in parts if p]
+        return [p.strip().upper() for p in symbol.split(",") if p.strip()]
     return []
 
 
+def _extract_losses(model) -> dict:
+    losses = getattr(model.logger, "name_to_value", {}) or {}
+    def _cast(x):
+        try: return float(x)
+        except Exception: return None
+    return {
+        "policy_loss": _cast(losses.get("train/policy_loss")),
+        "value_loss": _cast(losses.get("train/value_loss")),
+        "entropy": _cast(losses.get("train/entropy_loss")),
+        "explained_variance": _cast(losses.get("train/explained_variance")),
+        "approx_kl": _cast(losses.get("train/approx_kl")),
+        "clip_fraction": _cast(losses.get("train/clip_fraction")),
+    }
+
 # ======================================================
-# PPO Trainer
+# Atomic/threaded save helpers
 # ======================================================
-def train_agent(
-    symbol: Union[str, List[str]],
-    model_name: str = "ppo_agent_v1",
-    total_timesteps: int = 200_000,
-    start: str = "2015-01-01",
-    end: str = "2025-01-01",
-):
-    """
-    Train PPO agent with realistic option-based rewards and optional multi-symbol input.
-    Compatible with 49-dim flattened env observations.
-    """
+def atomic_save_file(target_path: Path, write_bytes: bytes):
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=str(target_path.parent), delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+        tmp.write(write_bytes)
+        tmp.flush()
+        os.fsync(tmp.fileno())
+    os.replace(tmp_path, target_path)
+
+
+def dump_sb3_model_to_bytes(model: PPO) -> bytes:
+    with tempfile.NamedTemporaryFile(suffix=".zip", delete=False) as tmp:
+        tmp_path = Path(tmp.name)
     try:
-        symbols = _parse_symbols(symbol)
-        if not symbols:
-            raise ValueError("No valid symbols provided for training.")
+        model.save(str(tmp_path))
+        return tmp_path.read_bytes()
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
-        env_fns = [make_env(sym, start=start, end=end) for sym in symbols]
-        env = DummyVecEnv(env_fns)
-        env = VecNormalize(env, norm_obs=True, norm_reward=False, clip_obs=5.0)
 
-        policy_kwargs = dict(net_arch=[256, 256])
-        model = PPO(
-            "MlpPolicy",
-            env,
-            verbose=1,
-            learning_rate=1e-4,
-            n_steps=4096,
-            batch_size=512,
-            n_epochs=10,
-            gamma=0.995,
-            gae_lambda=0.95,
-            clip_range=0.2,
-            ent_coef=0.002,
-            vf_coef=0.7,
-            policy_kwargs=policy_kwargs,
-            tensorboard_log=str(LOGS_DIR / "tensorboard"),
-        )
+def dump_vecnorm_to_bytes(vecnorm: VecNormalize) -> bytes:
+    with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as tmp:
+        tmp_path = Path(tmp.name)
+    try:
+        vecnorm.save(str(tmp_path))
+        return tmp_path.read_bytes()
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
-        chunks = 10
-        chunk_steps = total_timesteps // chunks
-        model_path = MODELS_DIR / f"{model_name}_{symbols[0] if len(symbols)==1 else 'MULTI'}.zip"
 
-        checkpoint_callback = CheckpointCallback(
-            save_freq=max(1, chunk_steps // 2),
-            save_path=str(MODELS_DIR),
-            name_prefix=f"checkpoint_{symbols[0] if symbols else 'SYM'}",
-        )
+async def safe_save_model_and_vecnorm(model: PPO, vecnorm: VecNormalize, model_path: Path):
+    vec_path = model_path.with_name(model_path.stem + "_vecnorm.pkl")
+    model_bytes, vec_bytes = await asyncio.gather(
+        asyncio.to_thread(dump_sb3_model_to_bytes, model),
+        asyncio.to_thread(dump_vecnorm_to_bytes, vecnorm)
+    )
+    await asyncio.to_thread(atomic_save_file, model_path, model_bytes)
+    await asyncio.to_thread(atomic_save_file, vec_path, vec_bytes)
 
-        write_status({
-            "status": "started",
-            "symbols": symbols,
-            "model_name": model_name,
-            "total_timesteps": total_timesteps,
-        })
+# ======================================================
+# Streaming (SSE) Trainer
+# ======================================================
+async def train_agent_stream(symbol, model_name="ppo_agent_v1", total_timesteps=1_000_000,
+                             start="2015-01-01", end="2025-01-01", chunks=20,
+                             eval_episodes=5, save_every=5):
+    from asyncio import sleep
 
+    symbols = _parse_symbols(symbol)
+    if not symbols:
+        raise ValueError("No valid symbols provided for training.")
+
+    env_fns = [make_env(sym, start=start, end=end) for sym in symbols]
+    base_env = DummyVecEnv(env_fns)
+    env = VecNormalize(base_env, norm_obs=True, norm_reward=False, clip_obs=5.0)
+
+    policy_kwargs = dict(net_arch=[256, 256, 128], activation_fn=torch.nn.Tanh)
+    model = PPO("MlpPolicy", env, verbose=1, learning_rate=3e-4, n_steps=8192,
+                batch_size=1024, n_epochs=10, gamma=0.999, gae_lambda=0.95,
+                clip_range=0.3, ent_coef=0.01, vf_coef=0.5, max_grad_norm=0.5,
+                target_kl=0.03, policy_kwargs=policy_kwargs,
+                tensorboard_log=str(LOGS_DIR / "tensorboard"))
+
+    model_path = MODELS_DIR / f"{model_name}_{symbols[0] if len(symbols)==1 else 'MULTI'}.zip"
+    chunk_steps = max(1, total_timesteps // max(1, chunks))
+    start_time = time.time()
+
+    start_payload = {
+        "status": "started", "mode": "train", "symbols": symbols, "model_name": model_name,
+        "total_timesteps": total_timesteps, "chunks": chunks, "eval_episodes": eval_episodes,
+        "progress": 0, "timestamp": _utc_now_iso()
+    }
+    write_status(start_payload)
+    yield f"data: {json.dumps(start_payload)}\n\n"
+
+    try:
         for i in range(chunks):
-            model.learn(total_timesteps=chunk_steps, reset_num_timesteps=False, callback=checkpoint_callback)
+            model.learn(total_timesteps=chunk_steps, reset_num_timesteps=False)
             stats = compute_model_stats(model)
-            model.save(str(model_path))
-            env.save(str(model_path).replace(".zip", "_vecnorm.pkl"))
+            try:
+                val_mean, val_std = evaluate_policy(model, env, n_eval_episodes=eval_episodes)
+            except Exception:
+                val_mean, val_std = None, None
+            losses = _extract_losses(model)
 
-            write_status({
-                "status": "training",
-                "symbols": symbols,
-                "progress": f"{(i + 1) / chunks:.0%}",
-                "mean_reward": stats["mean_reward"],
-                "mean_episode_length": stats["mean_episode_length"],
-            })
+            if (i + 1) % save_every == 0:
+                await safe_save_model_and_vecnorm(model, env, model_path)
 
+            progress = int(((i + 1) / chunks) * 100)
+            elapsed = time.time() - start_time
+            eta = (elapsed / (i + 1)) * (chunks - (i + 1))
+            payload = {
+                "status": "training", "mode": "train", "symbols": symbols,
+                "model_name": model_name, "chunk": i + 1, "chunks": chunks, "progress": progress,
+                "mean_reward": stats["mean_reward"], "mean_episode_length": stats["mean_episode_length"],
+                "val_mean": val_mean, "val_std": val_std, **losses,
+                "elapsed_seconds": elapsed, "eta_seconds": eta, "timestamp": _utc_now_iso()
+            }
+            write_status(payload)
+            yield f"data: {json.dumps(payload)}\n\n"
+            await sleep(0.05)
+
+        # Final evaluation
         try:
-            val_mean, val_std = evaluate_policy(model, env, n_eval_episodes=10)
+            final_val_mean, final_val_std = evaluate_policy(model, env, n_eval_episodes=max(10, eval_episodes))
         except Exception:
-            val_mean, val_std = None, None
+            final_val_mean, final_val_std = None, None
 
-        write_status({
-            "status": "completed",
-            "symbols": symbols,
-            "model_name": model_name,
-            "model_path": str(model_path),
-            "mean_reward": stats["mean_reward"],
-            "mean_episode_length": stats["mean_episode_length"],
-            "validation_mean_reward": val_mean,
-            "validation_std_reward": val_std,
-        })
+        await safe_save_model_and_vecnorm(model, env, model_path)
 
-        # --- Save persistent metrics file ---
         metrics_path = model_path.with_suffix(".json")
         metrics_data = {
             "model_name": model_path.stem,
@@ -206,118 +236,139 @@ def train_agent(
             "metrics": {
                 "mean_reward": stats["mean_reward"],
                 "mean_episode_length": stats["mean_episode_length"],
-                "validation_mean_reward": float(val_mean) if val_mean is not None else None,
-                "validation_std": float(val_std) if val_std is not None else None,
+                "validation_mean_reward": float(final_val_mean) if final_val_mean is not None else None,
+                "validation_std": float(final_val_std) if final_val_std is not None else None,
             },
         }
         with open(metrics_path, "w") as f:
             json.dump(metrics_data, f, indent=2)
 
-        print(f"✅ Training completed for {symbols}. Model saved to {model_path}")
+        done_payload = {
+            "status": "completed", "mode": "train", "symbols": symbols,
+            "model_name": model_path.stem, "model_path": str(model_path),
+            "mean_reward": stats["mean_reward"], "mean_episode_length": stats["mean_episode_length"],
+            "val_mean": final_val_mean, "val_std": final_val_std, "progress": 100,
+            "timestamp": _utc_now_iso(),
+        }
+        write_status(done_payload)
+        yield f"data: {json.dumps(done_payload)}\n\n"
 
     except Exception as e:
-        write_status({"status": "error", "message": str(e)})
-        raise
+        err = {"status": "error", "mode": "train", "message": str(e), "timestamp": _utc_now_iso()}
+        write_status(err)
+        yield f"data: {json.dumps(err)}\n\n"
 
 
 # ======================================================
-# Streaming (SSE) Trainer
+# Streaming RESUME (continue existing model)
 # ======================================================
-async def train_agent_stream(
-    symbol: Union[str, List[str]],
-    model_name: str = "ppo_agent_v1",
-    total_timesteps: int = 200_000,
-    start: str = "2015-01-01",
-    end: str = "2025-01-01",
-):
-    """Async SSE trainer for live progress updates."""
+async def resume_training_stream(model_filename: str, total_timesteps=1_000_000,
+                                 chunks=20, eval_episodes=5, save_every=5):
     from asyncio import sleep
 
-    symbols = _parse_symbols(symbol)
-    if not symbols:
-        raise ValueError("No valid symbols provided for training.")
+    model_path = MODELS_DIR / model_filename
+    vec_path = model_path.with_name(model_path.stem + "_vecnorm.pkl")
+    if not model_path.exists():
+        raise FileNotFoundError(f"Model not found: {model_path}")
 
-    env_fns = [make_env(sym, start=start, end=end) for sym in symbols]
-    env = DummyVecEnv(env_fns)
-    env = VecNormalize(env, norm_obs=True, norm_reward=False, clip_obs=5.0)
+    # infer symbols from filename
+    parts = model_path.stem.split("_")
+    inferred_symbols = [parts[-1]] if len(parts) > 1 and parts[-1] != "MULTI" else ["AAPL", "GOOG"]
 
-    policy_kwargs = dict(net_arch=[256, 256])
-    model = PPO(
-        "MlpPolicy",
-        env,
-        verbose=1,
-        learning_rate=1e-4,
-        n_steps=4096,
-        batch_size=512,
-        n_epochs=10,
-        gamma=0.995,
-        gae_lambda=0.95,
-        clip_range=0.2,
-        ent_coef=0.002,
-        vf_coef=0.7,
-        policy_kwargs=policy_kwargs,
-    )
+    env_fns = [make_env(sym) for sym in inferred_symbols]
+    base_env = DummyVecEnv(env_fns)
+    if vec_path.exists():
+        env = VecNormalize.load(str(vec_path), base_env)
+        env.training = True
+        env.norm_reward = False
+    else:
+        env = VecNormalize(base_env, norm_obs=True, norm_reward=False, clip_obs=5.0)
 
-    chunks = 10
-    chunk_steps = total_timesteps // chunks
-    model_path = MODELS_DIR / f"{model_name}_{symbols[0] if len(symbols)==1 else 'MULTI'}.zip"
+    model = PPO.load(str(model_path), env=env, device="auto")
+    model.learning_rate = 2e-4
+    chunk_steps = max(1, total_timesteps // max(1, chunks))
+    start_time = time.time()
 
-    write_status({
-        "status": "started",
-        "symbols": symbols,
-        "model_name": model_name,
-        "total_timesteps": total_timesteps,
-    })
-    yield f"data: {json.dumps({'status': 'started', 'symbols': symbols, 'progress': 0})}\n\n"
-
-    stats = {"mean_reward": 0.0, "mean_episode_length": 1.0}
-    for i in range(chunks):
-        model.learn(total_timesteps=chunk_steps, reset_num_timesteps=False)
-        stats = compute_model_stats(model)
-        model.save(str(model_path))
-        env.save(str(model_path).replace(".zip", "_vecnorm.pkl"))
-
-        progress = int(((i + 1) / chunks) * 100)
-        write_status({
-            "status": "training",
-            "symbols": symbols,
-            "progress": progress,
-            "mean_reward": stats["mean_reward"],
-            "mean_episode_length": stats["mean_episode_length"],
-        })
-        yield f"data: {json.dumps({'status': 'training', 'symbols': symbols, 'progress': progress, **stats})}\n\n"
-        await sleep(0.05)
+    start_payload = {"status": "started", "mode": "resume", "symbols": inferred_symbols,
+                     "model_name": model_path.stem, "total_timesteps": total_timesteps,
+                     "chunks": chunks, "eval_episodes": eval_episodes, "progress": 0,
+                     "timestamp": _utc_now_iso()}
+    write_status(start_payload)
+    yield f"data: {json.dumps(start_payload)}\n\n"
 
     try:
-        val_mean, val_std = evaluate_policy(model, env, n_eval_episodes=10)
-    except Exception:
-        val_mean, val_std = None, None
+        for i in range(chunks):
+            model.learn(total_timesteps=chunk_steps, reset_num_timesteps=False)
+            stats = compute_model_stats(model)
+            try:
+                val_mean, val_std = evaluate_policy(model, env, n_eval_episodes=eval_episodes)
+            except Exception:
+                val_mean, val_std = None, None
+            losses = _extract_losses(model)
 
-    # Save final metrics persistently
-    metrics_path = model_path.with_suffix(".json")
-    metrics_data = {
-        "model_name": model_path.stem,
-        "symbols": symbols,
-        "trained_on": str(date.today()),
-        "framework": "stable-baselines3",
-        "path": str(model_path),
-        "metrics": {
-            "mean_reward": stats["mean_reward"],
-            "mean_episode_length": stats["mean_episode_length"],
-            "validation_mean_reward": float(val_mean) if val_mean is not None else None,
-            "validation_std": float(val_std) if val_std is not None else None,
-        },
-    }
-    with open(metrics_path, "w") as f:
-        json.dump(metrics_data, f, indent=2)
+            if (i + 1) % save_every == 0:
+                await safe_save_model_and_vecnorm(model, env, model_path)
 
-    write_status({
-        "status": "completed",
-        "symbols": symbols,
-        "model_name": model_name,
-        "model_path": str(model_path),
-        **stats,
-        "validation_mean_reward": val_mean,
-        "validation_std_reward": val_std,
-    })
-    yield f"data: {json.dumps({'status': 'completed', 'symbols': symbols, **stats, 'val_mean': val_mean, 'val_std': val_std})}\n\n"
+            progress = int(((i + 1) / chunks) * 100)
+            elapsed = time.time() - start_time
+            eta = (elapsed / (i + 1)) * (chunks - (i + 1))
+            payload = {"status": "training", "mode": "resume", "symbols": inferred_symbols,
+                       "model_name": model_path.stem, "chunk": i + 1, "chunks": chunks,
+                       "progress": progress, "mean_reward": stats["mean_reward"],
+                       "mean_episode_length": stats["mean_episode_length"], "val_mean": val_mean,
+                       "val_std": val_std, **losses, "elapsed_seconds": elapsed,
+                       "eta_seconds": eta, "timestamp": _utc_now_iso()}
+            write_status(payload)
+            yield f"data: {json.dumps(payload)}\n\n"
+            await sleep(0.05)
+
+        # Final evaluation
+        try:
+            final_val_mean, final_val_std = evaluate_policy(model, env, n_eval_episodes=max(10, eval_episodes))
+        except Exception:
+            final_val_mean, final_val_std = None, None
+
+        await safe_save_model_and_vecnorm(model, env, model_path)
+
+        metrics_path = model_path.with_suffix(".json")
+        metrics_data = {
+            "model_name": model_path.stem,
+            "symbols": inferred_symbols,
+            "trained_on": str(date.today()),
+            "framework": "stable-baselines3",
+            "path": str(model_path),
+            "metrics": {
+                "mean_reward": stats["mean_reward"],
+                "mean_episode_length": stats["mean_episode_length"],
+                "validation_mean_reward": float(final_val_mean) if final_val_mean is not None else None,
+                "validation_std": float(final_val_std) if final_val_std is not None else None,
+            },
+        }
+        with open(metrics_path, "w") as f:
+            json.dump(metrics_data, f, indent=2)
+
+        done_payload = {"status": "completed", "mode": "resume", "symbols": inferred_symbols,
+                        "model_name": model_path.stem, "model_path": str(model_path),
+                        "mean_reward": stats["mean_reward"], "mean_episode_length": stats["mean_episode_length"],
+                        "val_mean": final_val_mean, "val_std": final_val_std, "progress": 100,
+                        "timestamp": _utc_now_iso()}
+        write_status(done_payload)
+        yield f"data: {json.dumps(done_payload)}\n\n"
+
+    except Exception as e:
+        err = {"status": "error", "mode": "resume", "message": str(e), "timestamp": _utc_now_iso()}
+        write_status(err)
+        yield f"data: {json.dumps(err)}\n\n"
+
+# ======================================================
+# Synchronous wrapper (for BackgroundTasks)
+# ======================================================
+def train_agent(symbol, model_name="ppo_agent_v1", total_timesteps=1_000_000,
+                start="2015-01-01", end="2025-01-01", chunks=20,
+                eval_episodes=5, save_every=5):
+    """Sync training entrypoint."""
+    async def runner():
+        async for _ in train_agent_stream(symbol, model_name, total_timesteps,
+                                          start, end, chunks, eval_episodes, save_every):
+            pass
+    asyncio.run(runner())

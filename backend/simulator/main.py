@@ -97,56 +97,57 @@ def black_scholes_price(S: float, K: float, T: float, r: float, sigma: float, op
 
 def load_chain_iv(symbol: str, approx_expiry: date, strike: float, opt_type: str):
     """
-    Try to fetch a near 30D expiry and return yahoo IV for the nearest strike.
-    Note: Yahoo chains are *current*, not historical. We only use IV as a proxy for sigma.
+    Fetch near-term chain and return IV and strike increment near current price.
+    Uses smallest local spacing near target strike for realism.
     """
     try:
         tk = yf.Ticker(symbol)
         expiries = tk.options or []
         if not expiries:
-            return None, None
+            return None, 1.0
 
-        # pick expiry closest to approx_expiry but >= approx_expiry if possible
+        # pick expiry closest to approx_expiry but >= target if possible
         target = pd.to_datetime(approx_expiry)
         parsed = pd.to_datetime(expiries)
         diffs = (parsed - target).days.values
-        # prefer non-negative diffs (future), else smallest absolute
         idx = None
         non_neg = np.where(diffs >= 0)[0]
-        if len(non_neg) > 0:
-            idx = non_neg[np.argmin(diffs[non_neg])]
-        else:
-            idx = int(np.argmin(np.abs(diffs)))
+        idx = non_neg[np.argmin(diffs[non_neg])] if len(non_neg) > 0 else int(np.argmin(np.abs(diffs)))
 
         expiry_str = expiries[idx]
         chain = tk.option_chain(expiry_str)
-        table = chain.calls if opt_type == "CALL" else chain.puts
+        table = chain.calls if opt_type.upper() == "CALL" else chain.puts
         if table is None or table.empty:
-            return None, None
+            return None, 1.0
 
-        # nearest strike row
         table = table.dropna(subset=["strike"])
         table["dist"] = np.abs(table["strike"] - strike)
-        row = table.loc[table["dist"].idxmin()] if "dist" in table.columns else None
-        if row is None:
-            return None, None
+        table = table.sort_values("dist")
 
-        # impliedVolatility is fraction (e.g., 0.32); typical Yahoo column name is 'impliedVolatility'
+        # nearest strike IV
+        row = table.iloc[0]
         iv = float(row.get("impliedVolatility", np.nan))
         if not np.isfinite(iv) or iv <= 0:
             iv = None
 
-        # pick a reasonable strike increment from chain
-        # infer increment from unique sorted strikes
+        # --- compute LOCAL increment near the strike (not global) ---
         uniq = np.sort(table["strike"].unique())
-        inc = None
-        if len(uniq) >= 2:
-            inc = float(np.round(uniq[1] - uniq[0], 2))
+        inc = 1.0
+        if len(uniq) > 2:
+            # find local spacing near the strike
+            idx = np.searchsorted(uniq, strike)
+            left = uniq[max(0, idx - 2): idx + 3]
+            if len(left) >= 2:
+                local_diffs = np.diff(left)
+                inc = float(np.round(np.median(local_diffs), 2))
+                if inc > 10:  # cap unrealistic increments
+                    inc = 1.0
 
         expiry_date = pd.to_datetime(expiry_str).date()
-        return iv, inc or 1.0
+        return iv, inc
     except Exception:
-        return None, None
+        return None, 1.0
+
 
 # ------------------------------------------------------------
 # Core simulation (intraday open->close per day)
