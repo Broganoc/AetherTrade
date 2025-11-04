@@ -271,9 +271,21 @@ async def resume_training_stream(model_filename: str, total_timesteps=1_000_000,
     if not model_path.exists():
         raise FileNotFoundError(f"Model not found: {model_path}")
 
-    # infer symbols from filename
-    parts = model_path.stem.split("_")
-    inferred_symbols = [parts[-1]] if len(parts) > 1 and parts[-1] != "MULTI" else ["AAPL", "GOOG"]
+    # --- Load symbols from JSON metadata if available ---
+    metrics_path = model_path.with_suffix(".json")
+    inferred_symbols = []
+    if metrics_path.exists():
+        try:
+            with open(metrics_path, "r") as f:
+                meta = json.load(f)
+                inferred_symbols = meta.get("symbols", [])
+        except Exception as e:
+            print(f"[WARN] Could not parse metadata: {e}")
+
+    # fallback if metadata missing
+    if not inferred_symbols:
+        parts = model_path.stem.split("_")
+        inferred_symbols = [parts[-1]] if len(parts) > 1 and parts[-1] != "MULTI" else ["AAPL", "GOOG"]
 
     env_fns = [make_env(sym) for sym in inferred_symbols]
     base_env = DummyVecEnv(env_fns)

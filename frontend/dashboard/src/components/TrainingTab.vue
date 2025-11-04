@@ -423,17 +423,23 @@ export default {
             this.trainingStatus = `${label} ${data.symbols?.join(", ") || ""}`.trim();
             this.valMean = data.val_mean ?? this.valMean;
             this.valStd = data.val_std ?? this.valStd;
-            this.isCompleted = True;
+            this.isCompleted = true;
             this.isTraining = false;
 
+            // Immediately refresh model list after completion
+            setTimeout(() => this.fetchModels(), 1000);
+
+
+            // Give user a visual pause before clearing status
             setTimeout(() => {
               this.trainingStatus = "";
               this.trainingProgress = 0;
-              this.fetchModels();
-            }, 1500);
+            }, 2000);
 
-            this.eventSource.close();
-            this.eventSource = null;
+            if (this.eventSource) {
+              this.eventSource.close();
+              this.eventSource = null;
+            }
           } else if (data.status === "error") {
             this.hasError = true;
             this.isTraining = false;

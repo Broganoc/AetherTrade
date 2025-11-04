@@ -171,14 +171,11 @@
           </thead>
           <tbody>
             <tr
-              v-for="row in filteredTrades"
-              :key="row._key"
-              class="border-t border-gray-300 dark:border-gray-700 hover:opacity-90 transition-colors"
-              :class="{
-                'bg-green-50 dark:bg-green-900/20': row.action === 'CALL',
-                'bg-red-50 dark:bg-red-900/20': row.action === 'PUT',
-              }"
-            >
+                v-for="(row, i) in filteredTrades"
+                :key="row._key"
+                class="border-t border-gray-300 dark:border-gray-700 hover:opacity-90 transition-colors"
+                :class="i % 2 === 0 ? 'bg-gray-50 dark:bg-gray-800/40' : 'bg-gray-100 dark:bg-gray-700/40'"
+              >
               <td class="px-3 py-1 text-center">{{ row.date }}</td>
               <td class="px-3 py-1 text-center font-semibold">{{ row.action }}</td>
               <td class="px-3 py-1 text-center">{{ numberFmt(row.underlying_open) }}</td>
