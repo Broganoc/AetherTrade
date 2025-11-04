@@ -1,58 +1,62 @@
 # AetherTrade
 
-**Modular AI Trading & Simulation Framework**
+**Reinforcement Learning–Driven AI Trading Framework**
 
-AetherTrade is a modular, extensible platform for experimenting with AI-driven trading strategies.  
-It provides tools for **training predictive models**, **simulating trades on historical data**, and **visualizing results** via a lightweight web dashboard.  
-
-The project is designed to be **modular**, **scalable**, and **future-proof**, allowing easy integration of new AI models, multi-asset simulations, and eventually live paper trading.
+AetherTrade is a modular research and simulation platform for developing, training, and evaluating AI trading agents.  
+It uses reinforcement learning (RL) to train agents to trade options and equities using historical market data and provides a real-time web dashboard to visualize training progress, performance, and simulations.
 
 ---
 
-## Features
+## Key Features
 
-- Train and test machine learning or reinforcement learning models.
-- Simulate trades on historical financial data with detailed portfolio tracking.
-- Modular dashboard for monitoring models and simulation results.
-- Async task execution with Celery + Redis for long-running tasks.
-- JSON-based APIs for interoperability and frontend integration.
-- Extensible architecture ready for multiple assets, broker APIs, and mobile clients.
+- Train PPO (Proximal Policy Optimization) agents using `stable-baselines3`
+- Resume training from saved checkpoints (supports multi-symbol models)
+- Run simulations (backtests) on historical data with detailed trade-level logs
+- Real-time dashboard with:
+  - Live metrics via Server-Sent Events (SSE)
+  - Progress tracking, reward and loss visualization, validation stats
+  - Trade log filtering, alternating row colors, and P&L highlighting
+- Atomic model saving with `VecNormalize` statistics
+- Redis-powered live status updates for asynchronous monitoring
+- Fully containerized via Docker for reproducibility and deployment
 
 ---
 
 ## Architecture
 
-AetherTrade consists of three main modules:
+AetherTrade is composed of three core services:
 
-1. **AI Trainer** – Python module to train, test, and save models with metadata.
-2. **Simulator** – Python module to run backtests and output portfolio stats and trade histories.
-3. **Dashboard** – Web-based React frontend for controlling modules and visualizing results.
+| Module | Description |
+|---------|--------------|
+| **Trainer** | Trains PPO agents using a custom `OptionTradingEnv` and streams metrics via SSE |
+| **Simulator** | Loads trained models, runs backtests on historical data, and returns trade logs and portfolio performance |
+| **Dashboard** | Vue 3 + Tailwind web interface for launching, resuming, and visualizing model performance |
 
-All modules communicate via **JSON REST APIs** and can run independently or together.
+All modules communicate through **FastAPI JSON APIs** and **Server-Sent Events**, sharing persistent storage under `/app/models` and `/app/logs`.
 
 ---
 
 ## Tech Stack
 
 | Category | Technologies |
-|----------|--------------|
-| **Frontend** | React, TypeScript, Recharts/ApexCharts |
-| **Backend** | FastAPI (Python 3.11+) |
-| **Task Queue** | Celery + Redis |
-| **AI/ML** | scikit-learn, pandas, numpy, PyTorch, stable-baselines3 |
-| **Data** | yfinance, pandas_ta |
-| **Storage** | SQLite (dev), Redis cache, Postgres (future) |
-| **Infrastructure** | Docker Compose, optional GPU support |
-| **Monitoring** | Prometheus + Grafana |
+|-----------|--------------|
+| **Frontend** | Vue 3, Vite, Tailwind CSS |
+| **Backend** | FastAPI (Python 3.11+), stable-baselines3 |
+| **Environment** | Custom `OptionTradingEnv` (Gymnasium), yfinance, pandas_ta |
+| **State / Cache** | Redis |
+| **Machine Learning** | PyTorch, NumPy |
+| **Infrastructure** | Docker Compose, persistent volumes |
+| **Visualization** | TensorBoard, live SSE dashboard |
 
 ---
 
 ## Quick Start
 
-### 1. Clone the repository
+### 1. Clone and Launch
 ```bash
 git clone https://github.com/<your-username>/AetherTrade.git
 cd AetherTrade
+docker-compose up --build
 ```
 
 ### 2. Set up Docker environment
