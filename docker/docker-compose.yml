@@ -36,6 +36,23 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
 
+  predictor:
+    build:
+      context: ../backend
+      dockerfile: predictions/Dockerfile
+    container_name: aethertrade_predictor
+    ports:
+      - "8003:8003"
+    volumes:
+      - ../backend/shared:/app/shared
+      - models:/app/models
+      - predictions_data:/app/predictions_data
+    depends_on:
+      - redis
+    environment:
+      - PYTHONUNBUFFERED=1
+
+
   dashboard:
     build:
       context: ../frontend/dashboard
@@ -53,4 +70,6 @@ services:
 volumes:
   models:
   logs:
+  predictions_data:
   redis_data:
+

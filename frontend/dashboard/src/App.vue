@@ -1,5 +1,8 @@
 <template>
-  <div :class="{ dark: isDarkMode }" class="min-h-screen bg-gray-50 dark:bg-gray-900 text-gray-900 dark:text-gray-200">
+  <div
+    :class="{ dark: isDarkMode }"
+    class="min-h-screen bg-gray-50 dark:bg-gray-900 text-gray-900 dark:text-gray-200"
+  >
     <!-- NavBar -->
     <NavBar
       :active-tab="activeTab"
@@ -12,6 +15,7 @@
     <div class="tab-content p-6">
       <TrainingTab v-if="activeTab === 'training'" />
       <SimulatorTab v-if="activeTab === 'simulator'" />
+      <RecTab v-if="activeTab === 'recommendations'" />
     </div>
   </div>
 </template>
@@ -19,13 +23,19 @@
 <script>
 import TrainingTab from './components/TrainingTab.vue'
 import SimulatorTab from './components/SimulatorTab.vue'
+import RecTab from './components/RecTab.vue'
 import NavBar from './components/NavBar.vue'
 
 export default {
-  components: { TrainingTab, SimulatorTab, NavBar },
+  components: {
+    TrainingTab,
+    SimulatorTab,
+    RecTab,
+    NavBar
+  },
   data() {
     return {
-      activeTab: 'training',
+      activeTab: 'training', // default tab
       isDarkMode: false
     }
   },
@@ -36,3 +46,10 @@ export default {
   }
 }
 </script>
+
+<style>
+/* optional – smoother transitions when switching tabs */
+.tab-content {
+  transition: opacity 0.3s ease-in-out;
+}
+</style>

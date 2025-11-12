@@ -1,0 +1,43 @@
+[tool.poetry]
+name = "aethertrade-predictions"
+version = "0.1.0"
+description = "Prediction microservice for AetherTrade — runs PPO model inference and caches trade recommendations."
+authors = ["Ben <you@example.com>"]
+package-mode = false
+
+[tool.poetry.dependencies]
+python = ">=3.12,<3.15"
+
+# Core web stack
+fastapi = "^0.115.0"
+uvicorn = { extras = ["standard"], version = "^0.30.0" }
+
+# ML / data stack (aligned with simulator)
+numpy = "^1.26.0"
+pandas = "^2.2.0"
+scipy = "^1.13.0"
+gymnasium = "^1.2.1"
+stable-baselines3 = "^2.3.0"
+sb3-contrib = "^2.3.0"       # Optional, for recurrent or advanced policies
+ta = "^0.11.0"
+yfinance = "^0.2.38"
+
+# ✅ CPU-only PyTorch wheels (multi-platform)
+torch = [
+    { url = "https://download.pytorch.org/whl/cpu/torch-2.3.1%2Bcpu-cp312-cp312-win_amd64.whl", markers = "sys_platform == 'win32'" },
+    { url = "https://download.pytorch.org/whl/cpu/torch-2.3.1%2Bcpu-cp312-cp312-linux_x86_64.whl", markers = "sys_platform == 'linux'" }
+]
+
+torchaudio = [
+    { url = "https://download.pytorch.org/whl/cpu/torchaudio-2.3.1%2Bcpu-cp312-cp312-win_amd64.whl", markers = "sys_platform == 'win32'" },
+    { url = "https://download.pytorch.org/whl/cpu/torchaudio-2.3.1%2Bcpu-cp312-cp312-linux_x86_64.whl", markers = "sys_platform == 'linux'" }
+]
+
+torchvision = [
+    { url = "https://download.pytorch.org/whl/cpu/torchvision-0.18.1%2Bcpu-cp312-cp312-win_amd64.whl", markers = "sys_platform == 'win32'" },
+    { url = "https://download.pytorch.org/whl/cpu/torchvision-0.18.1%2Bcpu-cp312-cp312-linux_x86_64.whl", markers = "sys_platform == 'linux'" }
+]
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"

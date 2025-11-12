@@ -332,8 +332,28 @@ def run_simulation(model_path: str, symbol: str, start: str, end: str, starting_
         total_proceeds = unit_proceeds * contracts
         cash += total_proceeds
 
+        # ------------------------------------------------------------
+        # Stop-loss logic (volatility-adjusted)
+        # ------------------------------------------------------------
+        # Base stop = 15% but scaled by volatility (~0.5×σ)
+        vol_stop = max(0.10, min(0.25, 0.5 * sigma_open))  # between 10–25%
+        stop_loss_pct = -vol_stop  # negative threshold
+
+        # compute initial P&L
         pnl = total_proceeds - total_cost
-        pnl_pct = (pnl / total_cost * 100.0) if total_cost > 0 else 0.0
+        pnl_pct = (pnl / total_cost) if total_cost > 0 else 0.0
+
+        # If P&L breaches stop-loss → exit early at stop
+        if pnl_pct <= stop_loss_pct:
+            # force exit at stop threshold
+            opt_close = opt_open * (1.0 + stop_loss_pct)
+            total_proceeds = opt_close * 100.0 * contracts
+            cash = cash + total_proceeds - total_cost
+            pnl = total_proceeds - total_cost
+            pnl_pct = stop_loss_pct
+
+        # convert to percent
+        pnl_pct *= 100.0
 
         trades.append({
             "date": str(day),
