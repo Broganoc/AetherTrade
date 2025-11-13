@@ -2,11 +2,9 @@ import json, os, time, redis, asyncio, tempfile
 from pathlib import Path
 from datetime import datetime, date, timezone
 from typing import List, Union
-
 import numpy as np
 import gymnasium as gym
 import torch
-
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from stable_baselines3.common.monitor import Monitor
@@ -73,7 +71,19 @@ def compute_model_stats(model):
     }
 
 
+def ensure_date(x):
+    if isinstance(x, date):
+        return x
+    try:
+        return datetime.strptime(x, "%Y-%m-%d").date()
+    except:
+        return date(2015, 1, 1)
+
 def make_env(symbol: str, start="2015-01-01", end="2025-01-01"):
+
+    start = ensure_date(start)
+    end = ensure_date(end)
+
     def _init():
         try:
             env = OptionTradingEnv(symbol=symbol, start=start, end=end)
@@ -167,8 +177,16 @@ async def train_agent_stream(symbol, model_name="ppo_agent_v1", total_timesteps=
     symbols = _parse_symbols(symbol)
     if not symbols:
         raise ValueError("No valid symbols provided for training.")
+    try:
+        start_date = datetime.strptime(start, "%Y-%m-%d").date()
+    except:
+        start_date = datetime(2015, 1, 1).date()
 
-    env_fns = [make_env(sym, start=start, end=end) for sym in symbols]
+    try:
+        end_date = datetime.strptime(end, "%Y-%m-%d").date()
+    except:
+        end_date = datetime(2025, 1, 1).date()
+    env_fns = [make_env(sym, start=start_date, end=end_date) for sym in symbols]
     base_env = DummyVecEnv(env_fns)
     env = VecNormalize(base_env, norm_obs=True, norm_reward=False, clip_obs=5.0)
 
@@ -287,7 +305,7 @@ async def resume_training_stream(model_filename: str, total_timesteps=1_000_000,
         parts = model_path.stem.split("_")
         inferred_symbols = [parts[-1]] if len(parts) > 1 and parts[-1] != "MULTI" else ["AAPL", "GOOG"]
 
-    env_fns = [make_env(sym) for sym in inferred_symbols]
+    env_fns = [make_env(sym, start="2015-01-01", end="2025-01-01") for sym in inferred_symbols]
     base_env = DummyVecEnv(env_fns)
     if vec_path.exists():
         env = VecNormalize.load(str(vec_path), base_env)

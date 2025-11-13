@@ -20,5 +20,5 @@ ENV PYTHONPATH="/app"
 
 EXPOSE 8002
 
-CMD ["uvicorn", "simulator.main:app", "--host", "0.0.0.0", "--port", "8002"]
+CMD ["uvicorn", "simulator.main:app", "--host", "0.0.0.0", "--port", "8002", "--reload"]
 

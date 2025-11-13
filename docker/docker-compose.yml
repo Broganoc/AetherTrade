@@ -19,6 +19,7 @@ services:
     volumes:
       - models:/app/models
       - logs:/app/logs
+      - stock_data:/app/stock_data
     environment:
       - PYTHONUNBUFFERED=1
 
@@ -33,6 +34,7 @@ services:
       - redis
     volumes:
       - models:/app/models
+      - stock_data:/app/stock_data
     environment:
       - PYTHONUNBUFFERED=1
 
@@ -47,6 +49,7 @@ services:
       - ../backend/shared:/app/shared
       - models:/app/models
       - predictions_data:/app/predictions_data
+      - stock_data:/app/stock_data
     depends_on:
       - redis
     environment:
@@ -72,4 +75,5 @@ volumes:
   logs:
   predictions_data:
   redis_data:
+  stock_data:
 
