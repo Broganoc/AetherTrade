@@ -7,6 +7,8 @@ import json
 
 from trainer.train import train_agent_stream, resume_training_stream, train_agent
 
+
+
 MODELS_DIR = Path("/app/models")
 LOGS_DIR = Path("/app/logs")
 STATUS_FILE = Path("/app/status.json")
@@ -107,7 +109,15 @@ async def train_stream(
     eval_episodes: int = Query(5),
     save_every: int = Query(5),
 ):
-    generator = train_agent_stream(symbol, model_name, timesteps, start, end, chunks, eval_episodes, save_every)
+    generator = train_agent_stream(
+        symbol,
+        model_name,
+        timesteps,
+        chunks,
+        eval_episodes,
+        save_every
+    )
+
     return StreamingResponse(generator, media_type="text/event-stream", headers={
         "Cache-Control": "no-cache",
         "Connection": "keep-alive",
@@ -123,7 +133,14 @@ async def resume_stream(
     eval_episodes: int = Query(5),
     save_every: int = Query(5),
 ):
-    generator = resume_training_stream(model_name, timesteps, chunks, eval_episodes, save_every)
+    generator = resume_training_stream(
+        model_name,
+        timesteps,
+        chunks,
+        eval_episodes,
+        save_every
+    )
+
     return StreamingResponse(generator, media_type="text/event-stream", headers={
         "Cache-Control": "no-cache",
         "Connection": "keep-alive",

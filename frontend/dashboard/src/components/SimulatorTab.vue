@@ -229,7 +229,7 @@ export default {
       models: [],
       selectedModel: "",
       symbol: "",
-      startDate: "2020-01-01",
+      startDate: "2024-12-01",
       endDate: "2025-01-01",
       startingBalance: 10000,
       simResult: null,
