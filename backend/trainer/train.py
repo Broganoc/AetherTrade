@@ -71,39 +71,31 @@ def _parse_symbols(symbol: Union[str, List[str]]) -> List[str]:
         return [p.strip().upper() for p in symbol.split(",") if p.strip()]
     return []
 
-
-# ======================================================
-# 1-Year Window Env Wrapper
-# ======================================================
 def make_env(symbol: str):
 
-    # Always use last 365 days from cached history
-    end_date = datetime.utcnow().date()
-    start_date = end_date - timedelta(days=365)
+    full_start = date(2010, 1, 1)
+    full_end   = date(2025, 1, 1)
+
+    # Choose a random end date between 2011 and 2025
+    def random_window():
+        # avoid early boundary
+        end_ts = full_start + timedelta(
+            days=np.random.randint(365, (full_end - full_start).days)
+        )
+        start_ts = end_ts - timedelta(days=365)
+        return start_ts, end_ts
 
     def _init():
-        try:
-            env = OptionTradingEnv(
-                symbol=symbol,
-                start=start_date.isoformat(),
-                end=end_date.isoformat()
-            )
-            return Monitor(env)
-        except Exception as e:
-            print(f"[WARN] Skipping {symbol}: {e}")
-
-            # Fallback dummy env
-            from gymnasium import spaces
-
-            class DummyEnv(gym.Env):
-                observation_space = spaces.Box(low=-1, high=1, shape=(49,), dtype=np.float32)
-                action_space = spaces.Discrete(3)
-                def reset(self, **kwargs): return np.zeros(49, dtype=np.float32), {}
-                def step(self, action): return np.zeros(49, dtype=np.float32), 0.0, True, False, {}
-
-            return Monitor(DummyEnv())
+        start_ts, end_ts = random_window()
+        env = OptionTradingEnv(
+            symbol=symbol,
+            start=start_ts.isoformat(),
+            end=end_ts.isoformat()
+        )
+        return Monitor(env)
 
     return _init
+
 
 
 # ======================================================

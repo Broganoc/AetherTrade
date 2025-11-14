@@ -103,8 +103,6 @@ async def train_stream(
     symbol: str = Query(...),
     model_name: str = Query("ppo_agent_v1"),
     timesteps: int = Query(1_000_0),
-    start: str = Query("2015-01-01"),
-    end: str = Query("2025-01-01"),
     chunks: int = Query(20),
     eval_episodes: int = Query(5),
     save_every: int = Query(5),

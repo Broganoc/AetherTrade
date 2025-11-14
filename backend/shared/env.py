@@ -44,14 +44,28 @@ class OptionTradingEnv(gym.Env):
         # --- Load data from cache ---
         full_df = load_cached_price_data(self.symbol)
 
-        start_ts = pd.to_datetime(self.start)
-        end_ts = pd.to_datetime(self.end)
+        # Convert dates
+        req_start = pd.to_datetime(self.start)
+        req_end = pd.to_datetime(self.end)
 
+        # Clamp to available range
+        df_min = full_df["Date"].min()
+        df_max = full_df["Date"].max()
+
+        start_ts = max(req_start, df_min)
+        end_ts = min(req_end, df_max)
+
+        # Slice
         mask = (full_df["Date"] >= start_ts) & (full_df["Date"] <= end_ts)
         self.df = full_df.loc[mask].copy()
 
+        # If still empty, fallback
         if self.df.empty:
-            raise ValueError(f"No cached data for {self.symbol} between {self.start} and {self.end}")
+            print(
+                f"[WARN] No cached data for {self.symbol} within requested or clamped range. "
+                f"Falling back to full dataset ({df_min.date()} → {df_max.date()})."
+            )
+            self.df = full_df.copy()
 
         # Compute indicators
         self._add_indicators()
