@@ -28,6 +28,24 @@ r = redis.Redis(host=os.getenv("REDIS_HOST", "aethertrade_redis"), port=6379, db
 # ======================================================
 # Utility Helpers
 # ======================================================
+def set_cancel_flag():
+    try:
+        r.set("cancel_training", "1")
+    except:
+        pass
+
+def clear_cancel_flag():
+    try:
+        r.delete("cancel_training")
+    except:
+        pass
+
+def is_cancelled() -> bool:
+    try:
+        return r.get("cancel_training") == b"1"
+    except:
+        return False
+
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -358,6 +376,16 @@ async def train_agent_stream(symbol, model_name="ppo_agent_v1",
 
     try:
         for i in range(chunks):
+            if is_cancelled():
+                cancel_payload = {
+                    "status": "cancelled",
+                    "mode": "train",
+                    "timestamp": _utc_now_iso()
+                }
+                write_status(cancel_payload)
+                yield f"data: {json.dumps(cancel_payload)}\n\n"
+                return
+
             model.learn(total_timesteps=chunk_steps, reset_num_timesteps=False)
 
             stats = compute_model_stats(model)
@@ -543,6 +571,16 @@ async def resume_training_stream(model_filename: str,
 
     try:
         for i in range(chunks):
+            if is_cancelled():
+                cancel_payload = {
+                    "status": "cancelled",
+                    "mode": "resume",
+                    "timestamp": _utc_now_iso()
+                }
+                write_status(cancel_payload)
+                yield f"data: {json.dumps(cancel_payload)}\n\n"
+                return
+
             model.learn(total_timesteps=chunk_steps, reset_num_timesteps=False)
 
             # Stats
@@ -755,6 +793,16 @@ async def full_train_stream(model_filename: str,
 
             # Inner chunk loop
             for i in range(chunks_per_round):
+                if is_cancelled():
+                    cancel_payload = {
+                        "status": "cancelled",
+                        "mode": "full_train",
+                        "timestamp": _utc_now_iso()
+                    }
+                    write_status(cancel_payload)
+                    yield f"data: {json.dumps(cancel_payload)}\n\n"
+                    return
+
                 model.learn(total_timesteps=chunk_steps, reset_num_timesteps=False)
 
                 stats = compute_model_stats(model)

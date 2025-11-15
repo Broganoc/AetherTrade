@@ -47,12 +47,13 @@
         {{ isTraining ? "Training..." : "Run Training" }}
       </button>
 
+      <!-- REAL STOP BUTTON -->
       <button
         v-if="isTraining"
         @click="cancelTraining"
         class="bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded shadow"
       >
-        Cancel
+        Stop
       </button>
     </div>
 
@@ -88,7 +89,7 @@
 
           <span>{{ trainingStatus }}</span>
 
-          <!-- Chunk counter only -->
+          <!-- Chunk counter -->
           <span v-if="chunk && chunksTotal" class="ml-2 text-xs">
             (Chunk {{ chunk }}/{{ chunksTotal }})
           </span>
@@ -145,7 +146,7 @@
           {{ model.metrics?.mean_episode_length?.toFixed(2) ?? "N/A" }}
         </p>
 
-        <!-- Expand / Details -->
+        <!-- Expand -->
         <transition name="fade">
           <div
             v-if="model.expanded"
@@ -167,18 +168,18 @@
             {{ model.expanded ? "Hide details" : "Show details" }}
           </button>
 
-          <!-- Train More toggle -->
+          <!-- Train More -->
           <button class="text-indigo-600 hover:text-indigo-700 text-sm" @click="toggleTrainMore(index)">
             {{ model.showTrainMore ? "Close" : "Train More" }}
           </button>
 
-          <!-- Full Train toggle -->
+          <!-- Full Train -->
           <button class="text-purple-600 hover:text-purple-700 text-sm" @click="toggleFullTrain(index)">
             {{ model.showFullTrain ? "Close" : "Full Train" }}
           </button>
         </div>
 
-        <!-- Train More inline controls -->
+        <!-- Train More inline -->
         <transition name="fade">
           <div v-if="model.showTrainMore" class="mt-3 p-3 rounded border dark:border-gray-700">
             <div class="flex items-center gap-2">
@@ -206,7 +207,7 @@
           </div>
         </transition>
 
-        <!-- Full Train inline controls -->
+        <!-- Full Train inline -->
         <transition name="fade">
           <div v-if="model.showFullTrain" class="mt-3 p-3 rounded border dark:border-gray-700">
             <button
@@ -222,6 +223,7 @@
             </p>
           </div>
         </transition>
+
       </div>
     </div>
   </div>
@@ -230,6 +232,7 @@
 <script>
 export default {
   name: "TrainingTab",
+
   data() {
     return {
       models: [],
@@ -260,7 +263,7 @@ export default {
 
       fullTrainWarnings: null,
 
-      // chunk progress only
+      // chunk progress
       chunk: null,
       chunksTotal: null,
 
@@ -355,11 +358,14 @@ export default {
     },
 
     // ----------- Normal Training -----------
-    runTraining() {
+    async runTraining() {
       if (!this.selectedSymbol) {
         this.trainingStatus = "Please enter a stock symbol!";
         return;
       }
+
+      // clear cancel flag
+      await fetch("http://localhost:8001/cancel_training", { method: "DELETE" });
 
       this.isTraining = true;
       this.isResumeMode = false;
@@ -377,9 +383,11 @@ export default {
     },
 
     // ----------- Resume Training -----------
-    startResume(model) {
+    async startResume(model) {
       const filename = model.path.split("/").pop();
       if (!filename) return;
+
+      await fetch("http://localhost:8001/cancel_training", { method: "DELETE" });
 
       this.isTraining = true;
       this.isResumeMode = true;
@@ -396,10 +404,12 @@ export default {
       this.startSSE(url.toString());
     },
 
-    // ----------- Full Training (infinite) -----------
-    startFullTrain(model) {
+    // ----------- Full Training -----------
+    async startFullTrain(model) {
       const filename = model.path.split("/").pop();
       if (!filename) return;
+
+      await fetch("http://localhost:8001/cancel_training", { method: "DELETE" });
 
       this.isTraining = true;
       this.isFullTrainMode = true;
@@ -426,6 +436,15 @@ export default {
         try {
           const data = JSON.parse(event.data);
 
+          // ---- CANCELLED ----
+          if (data.status === "cancelled") {
+            this.trainingStatus = "Training Cancelled";
+            this.isTraining = false;
+            if (this.eventSource) this.eventSource.close();
+            this.eventSource = null;
+            return;
+          }
+
           // ---- STARTED ----
           if (data.status === "started") {
             this.trainingProgress = data.progress || 0;
@@ -441,11 +460,7 @@ export default {
             if (data.mode === "resume") {
               this.trainingStatus = `Resuming ${data.symbols?.join(", ")}`;
             } else if (data.mode === "full_train") {
-              if (data.phase === "round_start") {
-                this.trainingStatus = `Full training continuing...`;
-              } else {
-                this.trainingStatus = `Full training`;
-              }
+              this.trainingStatus = "Full training…";
             } else {
               this.trainingStatus = `Training ${data.symbols?.join(", ")}`;
             }
@@ -521,28 +536,23 @@ export default {
       };
     },
 
+    // ----------- REAL STOP BUTTON -----------
     async cancelTraining() {
+      try {
+        await fetch("http://localhost:8001/cancel_training", {
+          method: "DELETE"
+        });
+      } catch (err) {
+        console.error("Failed to send cancel:", err);
+      }
+
       if (this.eventSource) {
         this.eventSource.close();
         this.eventSource = null;
       }
 
+      this.trainingStatus = "Stopping…";
       this.isTraining = false;
-      this.isCompleted = false;
-      this.hasError = false;
-
-      this.trainingStatus = "Training cancelled.";
-
-      try {
-        await fetch("http://localhost:8001/training_status", { method: "DELETE" });
-      } catch (err) {
-        console.error("Failed to cancel training:", err);
-      }
-
-      setTimeout(() => {
-        this.trainingProgress = 0;
-        this.trainingStatus = "";
-      }, 1000);
     },
 
     formatDuration(sec) {

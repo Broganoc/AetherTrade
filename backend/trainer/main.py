@@ -9,7 +9,9 @@ from trainer.train import (
     train_agent_stream,
     resume_training_stream,
     full_train_stream,
-    train_agent
+    train_agent,
+    set_cancel_flag,
+    clear_cancel_flag
 )
 
 MODELS_DIR = Path("/app/models")
@@ -135,6 +137,8 @@ async def train_stream(
     eval_episodes: int = Query(5),
     save_every: int = Query(5),
 ):
+    clear_cancel_flag()
+
     generator = train_agent_stream(
         symbol,
         model_name,
@@ -159,6 +163,8 @@ async def resume_stream(
     eval_episodes: int = Query(5),
     save_every: int = Query(5),
 ):
+    clear_cancel_flag()
+
     generator = resume_training_stream(
         model_name,
         timesteps,
@@ -184,6 +190,8 @@ async def full_train_api(
     chunks_per_round: int = Query(10),
     eval_episodes: int = Query(5),
 ):
+    clear_cancel_flag()
+
     generator = full_train_stream(
         model_filename=model_name,
         rounds=None,  # removed rounds
@@ -203,8 +211,8 @@ async def full_train_api(
 # ======================================================
 # Cancel Training
 # ======================================================
-@app.delete("/training_status")
+@app.delete("/cancel_training")
 def cancel_training():
-    if STATUS_FILE.exists():
-        STATUS_FILE.unlink()
-    return {"status": "cancelled"}
+    set_cancel_flag()
+    return {"status": "cancel_requested"}
+
