@@ -11,17 +11,35 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 # Format / clean a raw Yahoo dataframe
 # ===========================================
 def _clean_yahoo_df(df: pd.DataFrame):
-    if df.empty:
-        return df
-
-    # Flatten MultiIndex
+    # Flatten multiindex columns if needed
     if isinstance(df.columns, pd.MultiIndex):
-        df.columns = ["_".join(col).strip() for col in df.columns.values]
+        df.columns = ["_".join(col).strip() for col in df.columns]
 
-    df.reset_index(inplace=True)
-    df.rename(columns={df.columns[0]: "Date"}, inplace=True)
-    df["Date"] = pd.to_datetime(df["Date"])
+    # ------------------------------------
+    # 1) Handle case where 'Date' is in index
+    # ------------------------------------
+    if "Date" not in df.columns:
+        if isinstance(df.index, pd.DatetimeIndex):
+            df = df.copy()
+            df["Date"] = df.index
+            df.reset_index(drop=True, inplace=True)
+        else:
+            # look for any date-like column
+            date_cols = [c for c in df.columns if c.lower() in ["date", "datetime", "timestamp"]]
+            if len(date_cols) >= 1:
+                df.rename(columns={date_cols[0]: "Date"}, inplace=True)
+            else:
+                raise ValueError("No valid Date column found after cleaning")
 
+    # ------------------------------------
+    # 2) Ensure Date column is correct
+    # ------------------------------------
+    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df.dropna(subset=["Date"], inplace=True)
+
+    # ------------------------------------
+    # 3) Standardize Yahoo column names
+    # ------------------------------------
     rename_map = {}
     for col in df.columns:
         lower = col.lower()
@@ -40,18 +58,14 @@ def _clean_yahoo_df(df: pd.DataFrame):
 
     df.rename(columns=rename_map, inplace=True)
 
-    # Prefer raw Close over Adj Close
+    # ------------------------------------
+    # 4) Resolve Adj Close vs Close
+    # ------------------------------------
     if "Adj Close" in df.columns and "Close" in df.columns:
         df.drop(columns=["Adj Close"], inplace=True)
     elif "Adj Close" in df.columns:
         df.rename(columns={"Adj Close": "Close"}, inplace=True)
 
-    # Numeric types
-    for col in ["Open", "High", "Low", "Close", "Volume"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    df.dropna(subset=["Open", "High", "Low", "Close"], inplace=True)
     return df
 
 
@@ -87,31 +101,32 @@ def load_cached_price_data(symbol: str):
     path = CACHE_DIR / f"{symbol}.csv"
     today = date.today()
 
-    # 1) Missing file → full refresh
+    # 1) File missing → full refresh
     if not path.exists():
         return refresh_and_load(symbol)
 
     # 2) Load cached file
     try:
         df = pd.read_csv(path)
-        df["Date"] = pd.to_datetime(df["Date"])
     except Exception:
-        # corrupted file → refresh
         return refresh_and_load(symbol)
 
-    df = _clean_yahoo_df(df)
+    # Clean it (fix duplicate Date, rename, enforce Close, etc.)
+    try:
+        df = _clean_yahoo_df(df)
+    except Exception:
+        return refresh_and_load(symbol)
 
     if df.empty:
-        # no usable data → refresh
         return refresh_and_load(symbol)
 
     last_date = df["Date"].max().date()
 
-    # 3) Already up-to-date → return
+    # 3) Cache already up to date
     if last_date >= today:
         return df
 
-    # 4) Download only missing days
+    # 4) Download missing days
     start_missing = (last_date + timedelta(days=1)).strftime("%Y-%m-%d")
     end_missing = today.strftime("%Y-%m-%d")
 
@@ -123,13 +138,13 @@ def load_cached_price_data(symbol: str):
         progress=False,
     )
 
+    # Weekend, holiday, nothing new
     if new_df.empty:
-        # No new data (weekend/holiday) → return cached
         return df
 
     new_df = _clean_yahoo_df(new_df)
 
-    # 5) Merge + dedupe
+    # 5) Merge + dedupe on Date
     merged = pd.concat([df, new_df], ignore_index=True)
     merged.drop_duplicates(subset=["Date"], keep="last", inplace=True)
     merged.sort_values("Date", inplace=True)
@@ -138,6 +153,7 @@ def load_cached_price_data(symbol: str):
     merged.to_csv(path, index=False)
 
     return merged
+
 
 
 # ===========================================

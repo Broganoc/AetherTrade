@@ -983,8 +983,7 @@ async def full_train_stream(model_filename: str,
                 warnings["entropy_collapse"] or
                 warnings["kl_too_high"] or
                 warnings["val_down_train_up"] or
-                warnings["episode_length_shrink"] or
-                time_exceeded
+                warnings["episode_length_shrink"]
             )
 
             if should_stop:
