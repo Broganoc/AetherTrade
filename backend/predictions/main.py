@@ -117,7 +117,7 @@ def list_models():
     ]
     return models
 
-
+@app.get("/predict")
 @app.post("/predict")
 def predict(
     symbols: List[str] = Query(default=[]),
@@ -425,22 +425,15 @@ def backtest_all():
 @app.post("/genHistPreds")
 def generate_historical_real_predictions(
     days: int = Query(30, description="Number of past days to generate predictions for"),
-    symbols: List[str] = Query(default=None, description="Optional list of tickers. Defaults to NASDAQ100."),
+    symbols: List[str] = Query(default=None, description="Optional list of tickers. Defaults to NASDAQ100.")
 ):
     """
-    For each available model in /app/models:
-      - Load model into ModelPredictor
-      - For each day from (today-days) → yesterday
-      - Monkey-patch date in predictions to match target day
-      - Run real batch_prediction()
-      - Save file: YYYY-MM-DD_predictions_<MODEL_SUFFIX>.json
+    Generate REAL historical predictions for each model for each past day.
 
-    Skips:
-      - today or future dates
-      - files already existing for that date+model
+    Uses the updated ModelPredictor with target_date support.
     """
-
-    # default symbols = NASDAQ100
+    from shared.cache import load_cached_price_data, refresh_and_load
+    # Default symbols = NASDAQ 100
     if not symbols:
         from shared.symbols import NASDAQ_100 as NAS100
         symbols = NAS100
@@ -448,7 +441,7 @@ def generate_historical_real_predictions(
     today = date.today()
     start_day = today - timedelta(days=days)
 
-    # Collect model names like: ppo_agent_v1_TSLA
+    # Collect available model zip files
     model_list = [f.stem for f in MODELS_DIR.glob("*.zip")]
     if not model_list:
         return {"success": False, "detail": "No models found."}
@@ -456,50 +449,65 @@ def generate_historical_real_predictions(
     generated = {}
     skipped = {}
 
-    # Loop models
     for model_name in model_list:
-        model_suffix = model_name.split("_")[-1]  # TSLA
+        parts = model_name.split("_")
+
+        # Correct, unified suffix logic
+        if parts[-1] == "best":
+            model_suffix = f"{parts[-2]}_best"
+        else:
+            model_suffix = parts[-1]
+
         generated[model_name] = []
         skipped[model_name] = []
 
-        # actual predictor instance
+        # Load predictor instance once per model
         predictor = get_predictor(model_name)
 
-        # Loop dates
+        # Loop historical days
         for i in range(days):
             target_day = start_day + timedelta(days=i)
+
             if target_day >= today:
-                continue  # skip today/future
+                continue  # skip today or future
 
             date_str = target_day.strftime("%Y-%m-%d")
-
-            # Check if file already exists
             log_filename = f"{date_str}_predictions_{model_suffix}.json"
             log_path = LOG_DIR / log_filename
+
+            # Skip existing files
             if log_path.exists():
                 skipped[model_name].append(log_filename)
                 continue
 
-            # ------------------------------------
-            # Run REAL batch prediction and override date fields
-            # ------------------------------------
-            original_predict_symbol = predictor.predict_symbol
+            # Ensure cached symbol data exists
+            for sym in symbols:
+                try:
+                    df = load_cached_price_data(sym)
 
-            def patched_predict_symbol(sym, lookback=7, _date_override=date_str):
-                pred = original_predict_symbol(sym, lookback)
-                pred["date"] = _date_override
-                return pred
+                    if len(df) < 50:  # low threshold = at least enough for indicators
+                        raise ValueError("Insufficient cached data for indicators")
 
-            predictor.predict_symbol = patched_predict_symbol
+                except Exception as err:
+                    print(f"[Historical] Cache load failed for {sym} ({err}). Attempting refresh...")
 
+                    try:
+                        df = refresh_and_load(sym)
+                        print(f"[Historical] Successfully refreshed {sym}")
+
+                    except Exception as err2:
+                        print(f"[Historical] SKIPPING {sym}: Yahoo returned no data ({err2})")
+                        continue  # just skip this symbol entirely
+
+            # Generate REAL predictions for that date
             try:
-                output = predictor.batch_predict(symbols, lookback=7)
-                # Ensure all predictions use that date
-                output["predictions"] = [
-                    {**p, "date": date_str} for p in output["predictions"]
-                ]
+                output = predictor.batch_predict(
+                    symbols,
+                    lookback=7,
+                    target_date=date_str
+                )
 
-                # Save to correct filename
+                # Save to file
                 with open(log_path, "w") as f:
                     json.dump(output, f, indent=2)
 
@@ -507,9 +515,6 @@ def generate_historical_real_predictions(
 
             except Exception as e:
                 skipped[model_name].append(f"{log_filename} (ERR: {e})")
-
-            # Restore original method to avoid side effects
-            predictor.predict_symbol = original_predict_symbol
 
     return {
         "success": True,

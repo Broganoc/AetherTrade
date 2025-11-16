@@ -957,11 +957,6 @@ async def full_train_stream(model_filename: str,
                     if shrink_ratio < 0.5:  # >50% drop → stop
                         warnings["episode_length_shrink"] = True
 
-            # 6) wallclock limit
-            time_exceeded = False
-            if wallclock_limit_hours is not None:
-                if (time.time() - start_ts) / 3600.0 > wallclock_limit_hours:
-                    time_exceeded = True
 
             # Round-end SSE
             round_end_payload = {

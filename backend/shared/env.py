@@ -180,6 +180,14 @@ class OptionTradingEnv(gym.Env):
         self.means = self.df[features].mean()
         self.stds = self.df[features].std()
 
+    def _compute_indicators(self):
+        """
+        Wrapper used by predictor to recompute features after replacing df.
+        Just calls the existing ta-indicator pipeline.
+        """
+        self._add_indicators()
+        self._normalize_features()
+
     # -------------------------------------------------
     # Internal helpers: strikes & sigma
     # -------------------------------------------------
@@ -308,58 +316,50 @@ class OptionTradingEnv(gym.Env):
         """
         Fetch implied volatility (IV) near a given strike & target expiry.
 
-        Steps:
-          - Pull all option expirations from Yahoo
-          - Choose the closest expiration >= approx_expiry
-          - Choose CALL or PUT table
-          - Pick nearest strike row
-          - Return (IV, strike_increment)
+        Always returns THREE values:
+            (iv, local_increment, meta_info)
+
+        meta_info is currently unused but preserves backward compatibility.
         """
 
         try:
             tk = yf.Ticker(symbol)
             expiries = tk.options or []
             if not expiries:
-                return None, 1.0  # fallback
+                # Return 3 values always
+                return None, 1.0, None
 
-            # Convert expiry strings into datetime
+            # Convert expiry strings
             parsed = pd.to_datetime(expiries)
-
             target = pd.to_datetime(approx_expiry)
 
-            # Differences in days
             diffs = (parsed - target).days.values
-
-            # Prefer expiries >= target date
             non_neg = np.where(diffs >= 0)[0]
 
             if len(non_neg) > 0:
                 idx = non_neg[np.argmin(diffs[non_neg])]
             else:
-                # If none >= target, pick the closest expiry below
                 idx = int(np.argmin(np.abs(diffs)))
 
             expiry_str = expiries[idx]
-
             chain = tk.option_chain(expiry_str)
+
             table = chain.calls if action.upper() == "CALL" else chain.puts
-
             if table is None or table.empty:
-                return None, 1.0
+                return None, 1.0, None
 
-            # Clean table
+            # clean
             table = table.dropna(subset=["strike"])
             table["dist"] = np.abs(table["strike"] - strike)
             table = table.sort_values("dist")
 
-            # Closest strike row
             row = table.iloc[0]
 
             iv = float(row.get("impliedVolatility", np.nan))
             if not np.isfinite(iv) or iv <= 0:
                 iv = None
 
-            # Infer local strike increment (optional)
+            # Determine local strike increment
             uniq = np.sort(table["strike"].unique())
             local_inc = 1.0
             if len(uniq) > 2:
@@ -371,10 +371,12 @@ class OptionTradingEnv(gym.Env):
                     if local_inc <= 0 or local_inc > 20:
                         local_inc = 1.0
 
-            return iv, local_inc
+            # Always return 3 values
+            return iv, local_inc, None
 
         except Exception:
-            return None, 1.0  # fallback
+            return None, 1.0, None  # Always 3 values
+
     # -------------------------------------------------
     # Observation
     # -------------------------------------------------

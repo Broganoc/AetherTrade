@@ -16,6 +16,22 @@ function formatModelLabel(model) {
   return model.endsWith(".zip") ? model.slice(0, -4) : model;
 }
 
+function shortModelLabel(m) {
+  // remove .zip
+  const base = m.replace(".zip", "");
+
+  // Format: "ppo_agent_v1_TSLA" → ["ppo","agent","v1","TSLA"]
+  const parts = base.split("_");
+  let ticker = parts[parts.length - 1];
+  if(ticker == 'best'){
+    ticker = parts[parts.length - 2] + " " + parts[parts.length - 1];
+  }
+  else{
+    ticker = parts[parts.length - 1];
+  }
+  return `PPO / ${ticker}`;
+}
+
 // ------------------------------------------
 // Fetch available models
 // ------------------------------------------
@@ -230,14 +246,14 @@ function sortBy(colKey) {
 const accuracyColumns = computed(() =>
   allModels.value.map((m) => ({
     key: `acc_${m}`,
-    label: `${formatModelLabel(m)} Acc`,
+    label: `${shortModelLabel(m)} Acc`,
   }))
 );
 
 const pnlColumns = computed(() =>
   allModels.value.map((m) => ({
     key: `pnl_${m}`,
-    label: `${formatModelLabel(m)} PnL`,
+    label: `${shortModelLabel(m)} P&L %`,
   }))
 );
 
@@ -343,17 +359,25 @@ onMounted(() => {
       <table class="min-w-full text-sm text-gray-200 bg-gray-800 rounded">
         <thead>
           <tr class="border-b border-gray-700">
-            <th
-              class="text-left py-2 px-2 cursor-pointer"
-              @click="sortBy('symbol')"
-            >
+            <!-- Symbol -->
+            <th class="text-left py-2 px-2 cursor-pointer" @click="sortBy('symbol')">
               Symbol
-              <span v-if="sortColumn === 'symbol'">
-                {{ sortDir === 1 ? "▲" : "▼" }}
-              </span>
+              <span v-if="sortColumn === 'symbol'">{{ sortDir === 1 ? '▲' : '▼' }}</span>
             </th>
 
-            <!-- Per-model accuracy columns -->
+            <!-- Overall Accuracy -->
+            <th class="text-left py-2 px-2 cursor-pointer whitespace-nowrap" @click="sortBy('overall_acc')">
+              Overall Acc %
+              <span v-if="sortColumn === 'overall_acc'">{{ sortDir === 1 ? '▲' : '▼' }}</span>
+            </th>
+
+            <!-- Overall P&L -->
+            <th class="text-left py-2 px-2 cursor-pointer whitespace-nowrap" @click="sortBy('overall_pnl')">
+              Overall P&L %
+              <span v-if="sortColumn === 'overall_pnl'">{{ sortDir === 1 ? '▲' : '▼' }}</span>
+            </th>
+
+            <!-- Per-model Accuracy -->
             <th
               v-for="col in accuracyColumns"
               :key="col.key"
@@ -361,22 +385,10 @@ onMounted(() => {
               @click="sortBy(col.key)"
             >
               {{ col.label }}
-              <span v-if="sortColumn === col.key">
-                {{ sortDir === 1 ? "▲" : "▼" }}
-              </span>
+              <span v-if="sortColumn === col.key">{{ sortDir === 1 ? '▲' : '▼' }}</span>
             </th>
 
-            <th
-              class="text-left py-2 px-2 cursor-pointer whitespace-nowrap"
-              @click="sortBy('overall_acc')"
-            >
-              Overall Accuracy
-              <span v-if="sortColumn === 'overall_acc'">
-                {{ sortDir === 1 ? "▲" : "▼" }}
-              </span>
-            </th>
-
-            <!-- Per-model PnL columns -->
+            <!-- Per-model P&L -->
             <th
               v-for="col in pnlColumns"
               :key="col.key"
@@ -384,20 +396,9 @@ onMounted(() => {
               @click="sortBy(col.key)"
             >
               {{ col.label }}
-              <span v-if="sortColumn === col.key">
-                {{ sortDir === 1 ? "▲" : "▼" }}
-              </span>
+              <span v-if="sortColumn === col.key">{{ sortDir === 1 ? '▲' : '▼' }}</span>
             </th>
 
-            <th
-              class="text-left py-2 px-2 cursor-pointer whitespace-nowrap"
-              @click="sortBy('overall_pnl')"
-            >
-              Overall PnL
-              <span v-if="sortColumn === 'overall_pnl'">
-                {{ sortDir === 1 ? "▲" : "▼" }}
-              </span>
-            </th>
           </tr>
         </thead>
 
@@ -407,9 +408,26 @@ onMounted(() => {
             :key="row.symbol"
             class="border-b border-gray-700"
           >
+            <!-- Symbol -->
             <td class="py-2 px-2 font-semibold">{{ row.symbol }}</td>
 
-            <!-- Per-model accuracies -->
+            <!-- Overall Accuracy -->
+            <td class="py-2 px-2">
+              <span v-if="row.overall_acc != null">
+                {{ (row.overall_acc * 100).toFixed(2) }}%
+              </span>
+              <span v-else>—</span>
+            </td>
+
+            <!-- Overall P&L -->
+            <td class="py-2 px-2">
+              <span v-if="row.overall_pnl != null">
+                {{ (row.overall_pnl * 100).toFixed(2) }}%
+              </span>
+              <span v-else>—</span>
+            </td>
+
+            <!-- Per-model Accuracies -->
             <td
               v-for="col in accuracyColumns"
               :key="col.key"
@@ -421,31 +439,20 @@ onMounted(() => {
               <span v-else>—</span>
             </td>
 
-            <!-- Overall accuracy -->
-            <td class="py-2 px-2">
-              <span v-if="row.overall_acc != null">
-                {{ (row.overall_acc * 100).toFixed(2) }}%
-              </span>
-              <span v-else>—</span>
-            </td>
-
-            <!-- Per-model PnL -->
-            <td v-for="col in pnlColumns" :key="col.key" class="py-2 px-2">
+            <!-- Per-model P&L -->
+            <td
+              v-for="col in pnlColumns"
+              :key="col.key"
+              class="py-2 px-2"
+            >
               <span v-if="row[col.key] != null">
                 {{ (row[col.key] * 100).toFixed(2) }}%
               </span>
               <span v-else>—</span>
             </td>
-
-            <!-- Overall PnL -->
-            <td class="py-2 px-2">
-              <span v-if="row.overall_pnl != null">
-                {{ (row.overall_pnl * 100).toFixed(2) }}%
-              </span>
-              <span v-else>—</span>
-            </td>
           </tr>
         </tbody>
+
       </table>
     </div>
 
@@ -528,9 +535,21 @@ onMounted(() => {
 
 
 <style scoped>
+table {
+  table-layout: auto;
+}
+
 table th,
 table td {
-white-space: nowrap;
+  white-space: nowrap;
+  padding-right: 12px;
+}
+
+@media (max-width: 1200px) {
+  table {
+    font-size: 0.85rem;
+  }
 }
 </style>
+
 
