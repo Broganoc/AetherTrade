@@ -539,12 +539,12 @@ async def resume_training_stream(model_filename: str,
     base_env = DummyVecEnv(env_fns)
 
     if vec_path.exists():
-        print(f"🔄 Loading VecNormalize during resume: {vec_path}")
+        print(f"Loading VecNormalize during resume: {vec_path}")
         env = VecNormalize.load(str(vec_path), base_env)
         env.training = True
         env.norm_reward = False
     else:
-        print("⚠️ No VecNormalize for resume — creating new")
+        print("No VecNormalize for resume — creating new")
         env = VecNormalize(base_env, norm_obs=True, norm_reward=False, clip_obs=5.0)
 
     # Load existing PPO model
@@ -739,7 +739,7 @@ async def full_train_stream(model_filename: str,
     model.learning_rate = 2e-4  # more stable on resumes
     target_kl = getattr(model, "target_kl", 0.03) or 0.03
 
-    # Book-keeping
+    # Bookkeeping
     start_ts = time.time()
     history: List[Dict[str, Any]] = []
     best_val_reward = float("-inf")
