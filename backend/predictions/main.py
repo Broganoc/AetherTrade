@@ -138,6 +138,46 @@ def predict(
     except Exception as e:
         return {"detail": f"Prediction failed: {e}"}
 
+from pydantic import BaseModel
+
+class BatchRequest(BaseModel):
+    model_name: str
+    target_date: str | None = None
+    symbols: list[str] | None = None
+    lookback: int = 7
+
+@app.post("/batch_predict")
+def batch_predict(req: BatchRequest):
+    """
+    Run batch predictions using a selected model.
+    If no symbols are provided, defaults to NASDAQ 100.
+    """
+    try:
+        predictor = get_predictor(req.model_name)
+
+        # Default → NASDAQ 100
+        symbols = req.symbols or NASDAQ_100
+
+        output = predictor.batch_predict(
+            symbols=symbols,
+            lookback=req.lookback,
+            target_date=req.target_date
+        )
+
+        return {
+            "model": req.model_name,
+            "symbols": symbols,
+            "predictions": output["predictions"],
+            "enhanced_rankings": output["enhanced_rankings"],
+            "all_scored": output["all_scored"],
+            "timestamp": output["timestamp"]
+        }
+
+    except FileNotFoundError as e:
+        return {"detail": str(e)}
+    except Exception as e:
+        return {"detail": f"Batch prediction failed: {e}"}
+
 
 # ------------------------------------------------------------
 # Routes: logs (from predictor)

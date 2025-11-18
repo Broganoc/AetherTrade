@@ -45,7 +45,7 @@ const selectTab = (tab: string) => emit('change-tab', tab)
         Simulator
       </a>
 
-      <!-- 🔮 Recommendations -->
+      <!-- Recommendations -->
       <a href="#"
          @click.prevent="selectTab('recommendations')"
          :class="[
@@ -55,6 +55,18 @@ const selectTab = (tab: string) => emit('change-tab', tab)
              : 'text-gray-700 hover:text-blue-600 dark:text-gray-200 dark:hover:text-blue-400'
          ]">
         Recommendations
+      </a>
+
+      <!-- All Model Recs -->
+      <a href="#"
+         @click.prevent="selectTab('allModelsRecs')"
+         :class="[
+           'px-3 py-1 rounded transition',
+           activeTab === 'allModelsRecs'
+             ? 'bg-blue-600 text-white dark:bg-blue-500'
+             : 'text-gray-700 hover:text-blue-600 dark:text-gray-200 dark:hover:text-blue-400'
+         ]">
+        All Model Recs
       </a>
 
       <!-- Theme toggle (optional)

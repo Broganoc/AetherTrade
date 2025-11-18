@@ -16,6 +16,7 @@
       <TrainingTab v-if="activeTab === 'training'" />
       <SimulatorTab v-if="activeTab === 'simulator'" />
       <RecTab v-if="activeTab === 'recommendations'" />
+      <AllModelsRecsTab v-if="activeTab === 'allModelsRecs'" />
     </div>
   </div>
 </template>
@@ -24,6 +25,7 @@
 import TrainingTab from './components/TrainingTab.vue'
 import SimulatorTab from './components/SimulatorTab.vue'
 import RecTab from './components/RecTab.vue'
+import AllModelsRecsTab from './components/AllModelsRecsTab.vue'
 import NavBar from './components/NavBar.vue'
 
 export default {
@@ -31,11 +33,12 @@ export default {
     TrainingTab,
     SimulatorTab,
     RecTab,
+    AllModelsRecsTab,
     NavBar
   },
   data() {
     return {
-      activeTab: 'training', // default tab
+      activeTab: 'training',
       isDarkMode: false
     }
   },
@@ -48,7 +51,6 @@ export default {
 </script>
 
 <style>
-/* optional – smoother transitions when switching tabs */
 .tab-content {
   transition: opacity 0.3s ease-in-out;
 }
