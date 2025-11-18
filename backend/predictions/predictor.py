@@ -38,13 +38,28 @@ class ModelPredictor:
         def _init():
             env = OptionTradingEnv(symbol)
 
+            # CACHE-FIRST, SAFE VERSION
             try:
-                df = load_cached_price_data(symbol)
-            except:
-                df = refresh_and_load(symbol)
+                df = load_cached_price_data(symbol)  # respects minimized refresh rules
+            except Exception as e:
+                print(f"[Predictor] Cache load failed for {symbol}: {e}")
+                return env  # gracefully fallback but do NOT force refresh
+
+            if df is None or df.empty:
+                print(f"[Predictor] Cache empty for {symbol}, attempting full refresh...")
+                try:
+                    df = refresh_and_load(symbol)
+                except Exception as e:
+                    print(f"[Predictor] Full refresh failed: {e}")
+                    return env
 
             env.df = df.reset_index(drop=True)
-            env._compute_indicators()
+            try:
+                env._compute_indicators()
+            except Exception as e:
+                print(f"[Predictor] Indicator computation failed for {symbol}: {e}")
+                pass
+
             return env
 
         return DummyVecEnv([_init])
@@ -78,58 +93,56 @@ class ModelPredictor:
     # Build observation (optionally for a specific historical date)
     # -------------------------------------------------------------
     def _get_features(self, symbol: str, lookback: int = 7, target_date: str = None):
-        """
-        Build observation using cached data, fallback to refresh_and_load().
-        Supports historical date positioning.
-        """
-
         MIN_ROWS = 200
 
-        # 1) Try cache
+        # Load cache safely
         try:
             df = load_cached_price_data(symbol)
-        except:
+        except Exception as e:
+            print(f"[Predictor] Cache load failed for {symbol}: {e}")
             df = None
 
-        # 2) If cache insufficient → refresh
-        if df is None or len(df) < MIN_ROWS:
-            print(f"[Predictor] Cache insufficient for {symbol}. Refreshing...")
-            df = refresh_and_load(symbol)
+        # If cache is empty → try full refresh ONCE
+        if df is None or df.empty:
+            print(f"[Predictor] Cache empty for {symbol}, attempting refresh...")
+            try:
+                df = refresh_and_load(symbol)
+            except Exception as e:
+                raise ValueError(f"Cannot load data for {symbol}: {e}")
 
-        # 3) Now build a new environment
+        # Ensure minimum size
+        if len(df) < MIN_ROWS:
+            print(f"[Predictor] WARNING: df for {symbol} has only {len(df)} rows, continuing anyway")
+            # Do NOT force refresh — just proceed
+
+        # Build env
         env = OptionTradingEnv(symbol)
         env.df = df.reset_index(drop=True)
 
-        # 4) Recompute indicators
-        if hasattr(env, "_compute_indicators"):
+        try:
             env._compute_indicators()
-        else:
-            raise RuntimeError("OptionTradingEnv missing _compute_indicators()")
+        except Exception as e:
+            print(f"[Predictor] Indicator calc failed for {symbol}: {e}")
 
-        # 5) Position env at correct time
+        # Position the environment
         if target_date:
             target_ts = pd.to_datetime(target_date)
             matches = env.df.index[env.df["Date"] == target_ts]
-
             if len(matches) == 0:
-                raise ValueError(f"No price data for {symbol} on {target_date}")
-
+                raise ValueError(f"No data for {symbol} on {target_date}")
             env.current_step = int(matches[0])
-
         else:
-            env.current_step = len(env.df) - 1  # most recent
+            env.current_step = len(env.df) - 1
 
-        # 6) Validate enough rows for observation
         if env.current_step < env.window_size:
             raise ValueError(
                 f"Not enough prior rows ({env.current_step}) to build observation for {symbol}"
             )
 
-        # 7) Build observation
         obs = env._get_observation()
         obs = np.asarray(obs, dtype=np.float32).reshape(1, -1)
 
-        # 8) Extract price window
+        # Extract price window
         window_len = min(lookback, len(env.df))
         window = env.df.tail(window_len).copy()
 
@@ -173,27 +186,145 @@ class ModelPredictor:
     # -------------------------------------------------------------
     def batch_predict(self, symbols, lookback: int = 7, target_date: str = None):
         results = []
+
+        # -------------------------------------------------------------
+        # Run predictions for all symbols
+        # -------------------------------------------------------------
         for sym in symbols:
             try:
-                results.append(self.predict_symbol(sym, lookback, target_date=target_date))
+                results.append(
+                    self.predict_symbol(sym, lookback, target_date=target_date)
+                )
             except Exception as e:
-                print(f"Prediction failed for {sym}: {e}")
+                print(f"[Predictor] Prediction failed for {sym}: {e}")
 
-        # Sort by confidence
+        # Sort raw predictions (confidence only)
         results = sorted(results, key=lambda x: x["confidence"], reverse=True)
 
+        # -------------------------------------------------------------
+        # Load historical accuracy + pnl + recency metrics
+        # -------------------------------------------------------------
+        stats_path = self.pred_dir / "stats.json"
+        historical_acc = {}
+        historical_pnl = {}
+        recent_acc_map = {}
+        recent_pnl_map = {}
+
+        RECENT_N = 20  # number of recent predictions to consider
+
+        model_key = self.model_path.name  # MUST include .zip to match stats.json
+
+        if stats_path.exists():
+            try:
+                data = json.loads(stats_path.read_text())
+
+                for symbol, sdata in data.items():
+                    if symbol == "_all_models":
+                        continue
+
+                    # ----- Historical accuracy -----
+                    acc_table = sdata.get("model_accuracy", {})
+                    if model_key in acc_table:
+                        historical_acc[symbol] = float(acc_table[model_key])
+
+                    # ----- Historical pnl -----
+                    pnl_table = sdata.get("model_pnl", {})
+                    if model_key in pnl_table:
+                        historical_pnl[symbol] = float(pnl_table[model_key])
+
+                    # ----- Recency: last N recent entries -----
+                    entries = sdata.get("entries", [])
+                    recent_entries = [
+                        e for e in entries
+                        if e["model"] == model_key
+                    ]
+                    recent_entries = sorted(
+                        recent_entries,
+                        key=lambda x: x["date"],
+                        reverse=True
+                    )[:RECENT_N]
+
+                    if recent_entries:
+                        # recency accuracy
+                        recent_acc = sum(e["accuracy"] for e in recent_entries) / len(recent_entries)
+                        recent_acc_map[symbol] = recent_acc
+
+                        # recency pnl (raw)
+                        recent_pnl_raw = sum(e["pnl_pct"] for e in recent_entries) / len(recent_entries)
+                        recent_pnl_map[symbol] = recent_pnl_raw
+
+            except Exception as e:
+                print(f"[SmartRank] Failed to load stats.json: {e}")
+
+        # -------------------------------------------------------------
+        # SmartRank V3 (confidence + accuracy + pnl + recency)
+        # -------------------------------------------------------------
+        enhanced = []
+
+        for r in results:
+            symbol = r["symbol"]
+
+            # ----- 1. Confidence -----
+            conf = r["confidence"] / 100.0
+
+            # ----- 2. Historical accuracy -----
+            acc = historical_acc.get(symbol, 0.50)
+
+            # ----- 3. Historical pnl -----
+            pnl_raw = historical_pnl.get(symbol, 0.0)
+            hist_pnl_scaled = (pnl_raw + 1.0) / 2.0
+            hist_pnl_scaled = min(max(hist_pnl_scaled, 0.0), 1.0)
+
+            # ----- 4. Recency -----
+            recent_acc = recent_acc_map.get(symbol, 0.50)
+            recent_pnl_raw = recent_pnl_map.get(symbol, 0.0)
+
+            # normalize recency pnl
+            scaled_recent_pnl = (recent_pnl_raw + 1.0) / 2.0
+            scaled_recent_pnl = min(max(scaled_recent_pnl, 0.0), 1.0)
+
+            recency_score = (0.65 * recent_acc) + (0.35 * scaled_recent_pnl)
+
+            # ----- SmartRank V3 -----
+            combined = (
+                    (0.40 * conf) +
+                    (0.30 * acc) +
+                    (0.15 * hist_pnl_scaled) +
+                    (0.15 * recency_score)
+            )
+
+            enhanced.append({
+                **r,
+                "historical_accuracy": round(acc * 100, 2),
+                "historical_pnl": round(pnl_raw * 100, 2),
+                "recent_accuracy": round(recent_acc * 100, 2),
+                "recent_pnl": round(recent_pnl_raw * 100, 2),
+                "combined_score": round(combined, 6),
+            })
+
+        # -------------------------------------------------------------
+        # Top-25 by SmartRank score
+        # -------------------------------------------------------------
+        enhanced_sorted = sorted(enhanced, key=lambda x: x["combined_score"], reverse=True)
+        top_25 = enhanced_sorted[:25]
+
+        # -------------------------------------------------------------
+        # Final output package
+        # -------------------------------------------------------------
         output = {
             "timestamp": datetime.utcnow().isoformat(),
-            "model": self.model_path.name,
-            "predictions": results,
+            "model": self.model_path.stem,
+            "predictions": results,  # raw confidence sort
+            "enhanced_rankings": top_25,  # SmartRank Top-25
+            "all_scored": enhanced_sorted  # full ranked list for debugging
         }
 
-        # Filename logic
+        # -------------------------------------------------------------
+        # Save log file
+        # -------------------------------------------------------------
         date_str = target_date if target_date else datetime.now().strftime("%Y-%m-%d")
 
-        model_name = self.model_path.stem
-        parts = model_name.split("_")
-
+        parts = self.model_path.stem.split("_")
         if parts[-1] == "best":
             model_suffix = f"{parts[-2]}_best"
         else:
@@ -205,6 +336,7 @@ class ModelPredictor:
 
         with open(log_path, "w") as f:
             json.dump(output, f, indent=2)
+
         with open(latest_path, "w") as f:
             json.dump(output, f, indent=2)
 

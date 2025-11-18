@@ -523,3 +523,211 @@ def generate_historical_real_predictions(
         "generated": generated,
         "skipped": skipped,
     }
+
+@app.post("/backtest-update")
+def backtest_update():
+    """
+    Incremental version of backtest-all.
+    Only process NEW prediction files not yet included in stats.json.
+    """
+    from shared.cache import load_price_on_date, load_cached_price_data
+
+    yesterday = date.today() - timedelta(days=1)
+
+    # Load existing stats (or empty)
+    stats = load_stats() or {}
+    processed = []
+    skipped = []
+
+    # Track already-processed files
+    already_files = set()
+    if "_processed_files" in stats:
+        already_files = set(stats["_processed_files"])
+
+    # Gather available prediction files
+    pred_files = []
+
+    latest = PRED_DIR / "latest.json"
+    if latest.exists():
+        pred_files.append("latest.json")
+
+    for f in LOG_DIR.glob("*.json"):
+        pred_files.append(f"log/{f.name}")
+
+    new_files = [f for f in pred_files if f not in already_files]
+
+    if not new_files:
+        return {
+            "success": True,
+            "processed": [],
+            "skipped": pred_files,
+            "stats": stats,
+            "message": "No new prediction files to process"
+        }
+
+    # ------ Process only new files ------
+    for fname in new_files:
+        if fname == "latest.json":
+            path = PRED_DIR / "latest.json"
+        else:
+            path = LOG_DIR / Path(fname).name
+
+        if not path.exists():
+            skipped.append(fname)
+            continue
+
+        raw = json.loads(path.read_text())
+
+        if isinstance(raw, dict) and "predictions" in raw:
+            pred_list = raw["predictions"]
+            model_name = raw.get("model", "unknown")
+        else:
+            pred_list = raw
+            model_name = "unknown"
+
+        if not pred_list:
+            skipped.append(fname)
+            continue
+
+        try:
+            first_date_str = pred_list[0]["date"]
+            file_date = datetime.strptime(first_date_str, "%Y-%m-%d").date()
+        except Exception:
+            skipped.append(fname)
+            continue
+
+        if file_date >= yesterday:
+            skipped.append(fname)
+            continue
+
+        processed.append(fname)
+
+        # ---- Same prediction processing logic as backtest-all ----
+        for p in pred_list:
+            symbol = p["symbol"]
+            action = p["action"]
+            date_str = p["date"]
+
+            try:
+                row = load_price_on_date(symbol, date_str)
+            except:
+                continue
+
+            if row is None:
+                continue
+
+            open_px = float(row["Open"])
+            close_px = float(row["Close"])
+            if open_px <= 0:
+                continue
+
+            pct_change = (close_px - open_px) / open_px
+
+            if action == "CALL":
+                correct = 1 if close_px > open_px else 0
+            elif action == "PUT":
+                correct = 1 if close_px < open_px else 0
+            else:
+                correct = 1 if abs(pct_change) < 0.0025 else 0
+
+            # PnL eval
+            try:
+                strike = choose_strike(open_px, action)
+                hist = load_cached_price_data(symbol)
+                cutoff = pd.Timestamp(date_str)
+                hist = hist[hist["Date"] <= cutoff]
+                returns = hist["Close"].pct_change().dropna().tail(60)
+
+                if len(returns) >= 5:
+                    sigma_est = float(returns.std() * np.sqrt(252))
+                else:
+                    sigma_est = 0.20
+
+                sigma_est = max(0.05, min(2.0, sigma_est))
+
+                opt_open = black_scholes_price(open_px, strike, 35/365, 0.02, sigma_est, action)
+                opt_close = black_scholes_price(close_px, strike, 34/365, 0.02, sigma_est, action)
+
+                if opt_open <= 0:
+                    pnl_pct = 0.0
+                else:
+                    pnl_pct = (opt_close - opt_open) / opt_open
+            except Exception:
+                pnl_pct = 0.0
+
+            # --- Update stats ---
+            if symbol not in stats:
+                stats[symbol] = {
+                    "entries": [],
+                    "earliest_date": date_str,
+                    "latest_date": date_str,
+                    "overall_accuracy": 0.0,
+                    "overall_pnl": 0.0,
+                    "model_accuracy": {},
+                    "model_pnl": {},
+                }
+
+            sym_data = stats[symbol]
+            sym_data["earliest_date"] = min(sym_data["earliest_date"], date_str)
+            sym_data["latest_date"] = max(sym_data["latest_date"], date_str)
+
+            existing = next(
+                (e for e in sym_data["entries"] if e["date"] == date_str and e["model"] == model_name),
+                None,
+            )
+
+            if existing:
+                existing["accuracy"] = correct
+                existing["pnl_pct"] = pnl_pct
+            else:
+                sym_data["entries"].append({
+                    "date": date_str,
+                    "accuracy": correct,
+                    "pnl_pct": pnl_pct,
+                    "model": model_name,
+                })
+
+    # ---- Recompute aggregated stats ----
+    all_models_set = set()
+
+    for symbol, data in stats.items():
+        if symbol == "_processed_files":
+            continue
+
+        entries = data["entries"]
+
+        acc_list = [e["accuracy"] for e in entries]
+        pnl_list = [e["pnl_pct"] for e in entries]
+
+        data["overall_accuracy"] = sum(acc_list)/len(acc_list) if acc_list else 0
+        data["overall_pnl"] = sum(pnl_list)/len(pnl_list) if pnl_list else 0
+
+        model_groups = {}
+        for e in entries:
+            m = e["model"]
+            model_groups.setdefault(m, []).append(e)
+            all_models_set.add(m)
+
+        data["model_accuracy"] = {
+            m: sum(e["accuracy"] for e in lst) / len(lst)
+            for m, lst in model_groups.items()
+        }
+
+        data["model_pnl"] = {
+            m: sum(e["pnl_pct"] for e in lst) / len(lst)
+            for m, lst in model_groups.items()
+        }
+
+    stats["_all_models"] = sorted(list(all_models_set))
+
+    # Track already processed files
+    stats["_processed_files"] = sorted(list(already_files | set(processed)))
+
+    save_stats(stats)
+
+    return {
+        "success": True,
+        "processed": processed,
+        "skipped": skipped,
+        "stats": stats,
+    }

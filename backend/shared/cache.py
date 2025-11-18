@@ -6,72 +6,61 @@ from datetime import datetime, date, timedelta
 CACHE_DIR = Path("/app/stock_data")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-
-# ===========================================
-# Format / clean a raw Yahoo dataframe
-# ===========================================
+# ======================================================
+# CLEANING
+# ======================================================
 def _clean_yahoo_df(df: pd.DataFrame):
-    # Flatten multiindex columns if needed
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    # Flatten if multiindex
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = ["_".join(col).strip() for col in df.columns]
 
-    # ------------------------------------
-    # 1) Handle case where 'Date' is in index
-    # ------------------------------------
+    # Ensure Date exists
     if "Date" not in df.columns:
         if isinstance(df.index, pd.DatetimeIndex):
             df = df.copy()
             df["Date"] = df.index
             df.reset_index(drop=True, inplace=True)
         else:
-            # look for any date-like column
-            date_cols = [c for c in df.columns if c.lower() in ["date", "datetime", "timestamp"]]
-            if len(date_cols) >= 1:
-                df.rename(columns={date_cols[0]: "Date"}, inplace=True)
-            else:
-                raise ValueError("No valid Date column found after cleaning")
+            # Try fallback date column
+            for col in df.columns:
+                if "date" in col.lower():
+                    df.rename(columns={col: "Date"}, inplace=True)
+                    break
 
-    # ------------------------------------
-    # 2) Ensure Date column is correct
-    # ------------------------------------
+    if "Date" not in df.columns:
+        return pd.DataFrame()
+
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
     df.dropna(subset=["Date"], inplace=True)
 
-    # ------------------------------------
-    # 3) Standardize Yahoo column names
-    # ------------------------------------
+    # Rename common columns gracefully
     rename_map = {}
     for col in df.columns:
-        lower = col.lower()
-        if "open" in lower:
-            rename_map[col] = "Open"
-        elif "high" in lower:
-            rename_map[col] = "High"
-        elif "low" in lower:
-            rename_map[col] = "Low"
-        elif "close" in lower and "adj" not in lower:
-            rename_map[col] = "Close"
-        elif "adj" in lower and "close" in lower:
-            rename_map[col] = "Adj Close"
-        elif "volume" in lower:
-            rename_map[col] = "Volume"
+        c = col.lower()
+        if "open" in c: rename_map[col] = "Open"
+        if "high" in c: rename_map[col] = "High"
+        if "low" in c: rename_map[col] = "Low"
+        if "close" in c and "adj" not in c: rename_map[col] = "Close"
+        if "adj" in c and "close" in c: rename_map[col] = "Adj Close"
+        if "volume" in c: rename_map[col] = "Volume"
 
     df.rename(columns=rename_map, inplace=True)
 
-    # ------------------------------------
-    # 4) Resolve Adj Close vs Close
-    # ------------------------------------
+    # If both close+adj close, prefer normal close
     if "Adj Close" in df.columns and "Close" in df.columns:
         df.drop(columns=["Adj Close"], inplace=True)
-    elif "Adj Close" in df.columns:
+    elif "Adj Close" in df.columns and "Close" not in df.columns:
         df.rename(columns={"Adj Close": "Close"}, inplace=True)
 
     return df
 
 
-# ===========================================
-# FULL refetch (fallback)
-# ===========================================
+# ======================================================
+# REFRESH FULL HISTORY (only when necessary)
+# ======================================================
 def refresh_and_load(symbol: str):
     today = date.today().strftime("%Y-%m-%d")
 
@@ -83,10 +72,13 @@ def refresh_and_load(symbol: str):
         progress=False,
     )
 
-    if df.empty:
-        raise ValueError(f"No market data downloaded for {symbol}")
+    if df is None or df.empty:
+        raise ValueError(f"Yahoo returned empty dataset for full refresh: {symbol}")
 
     df = _clean_yahoo_df(df)
+
+    if df.empty:
+        raise ValueError(f"Cleaned dataframe empty after refresh: {symbol}")
 
     out_path = CACHE_DIR / f"{symbol}.csv"
     df.to_csv(out_path, index=False)
@@ -94,39 +86,40 @@ def refresh_and_load(symbol: str):
     return df
 
 
-# ===========================================
-# LOAD or UPDATE cached file
-# ===========================================
+# ======================================================
+# LOAD CACHE (minimally touching network)
+# ======================================================
 def load_cached_price_data(symbol: str):
     path = CACHE_DIR / f"{symbol}.csv"
     today = date.today()
 
-    # 1) File missing → full refresh
+    # 1) CACHE MISSING → full fetch
     if not path.exists():
         return refresh_and_load(symbol)
 
-    # 2) Load cached file
     try:
         df = pd.read_csv(path)
     except Exception:
+        # corrupt file → overwrite fully
         return refresh_and_load(symbol)
 
-    # Clean it (fix duplicate Date, rename, enforce Close, etc.)
-    try:
-        df = _clean_yahoo_df(df)
-    except Exception:
-        return refresh_and_load(symbol)
+    df = _clean_yahoo_df(df)
 
     if df.empty:
         return refresh_and_load(symbol)
 
-    last_date = df["Date"].max().date()
+    # Ensure sorted
+    df.sort_values("Date", inplace=True)
+    df.reset_index(drop=True, inplace=True)
 
-    # 3) Cache already up to date
-    if last_date >= today:
+    last_date = df["Date"].max().date()
+    delta = (today - last_date).days
+
+    # 2) CACHE IS CURRENT OR 1 DAY BEHIND → return without yahoo call
+    if delta <= 1:
         return df
 
-    # 4) Download missing days
+    # 3) Incremental update for only missing days
     start_missing = (last_date + timedelta(days=1)).strftime("%Y-%m-%d")
     end_missing = today.strftime("%Y-%m-%d")
 
@@ -138,27 +131,29 @@ def load_cached_price_data(symbol: str):
         progress=False,
     )
 
-    # Weekend, holiday, nothing new
-    if new_df.empty:
+    # If Yahoo gives nothing (weekend/holiday)
+    if new_df is None or new_df.empty:
         return df
 
     new_df = _clean_yahoo_df(new_df)
 
-    # 5) Merge + dedupe on Date
+    # If cleaning yields nothing, keep old cache
+    if new_df.empty:
+        return df
+
+    # merge
     merged = pd.concat([df, new_df], ignore_index=True)
     merged.drop_duplicates(subset=["Date"], keep="last", inplace=True)
     merged.sort_values("Date", inplace=True)
+    merged.reset_index(drop=True, inplace=True)
 
-    # 6) Save updated cache
     merged.to_csv(path, index=False)
-
     return merged
 
 
-
-# ===========================================
-# Price lookup
-# ===========================================
+# ======================================================
+# PRICE LOOKUP
+# ======================================================
 def load_price_on_date(symbol: str, date_str: str):
     df = load_cached_price_data(symbol)
     ts = pd.Timestamp(date_str)

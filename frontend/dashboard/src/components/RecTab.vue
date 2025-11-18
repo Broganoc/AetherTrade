@@ -4,6 +4,7 @@ import { ref, onMounted, computed } from "vue";
 const models = ref([]);
 const selectedModel = ref("");
 const predictions = ref([]);
+const enhanced = ref([]);
 const loading = ref(false);
 
 const stats = ref({});
@@ -32,6 +33,19 @@ function shortModelLabel(m) {
   return `PPO / ${ticker}`;
 }
 
+const smartSortColumn = ref("combined_score");
+const smartSortDir = ref(-1);
+
+const enhancedSorted = computed(() => {
+  return [...enhanced.value].sort((a, b) => {
+    const x = a[smartSortColumn.value];
+    const y = b[smartSortColumn.value];
+    if (x === y) return 0;
+    return (x > y ? 1 : -1) * smartSortDir.value;
+  });
+});
+
+
 // ------------------------------------------
 // Fetch available models
 // ------------------------------------------
@@ -54,7 +68,7 @@ async function loadStats() {
 }
 
 // ------------------------------------------
-// Run full backtest over all prediction files
+// Run full backtest over all prediction files or update backtest on only new files
 // ------------------------------------------
 async function runFullBacktest() {
   loading.value = true;
@@ -78,6 +92,29 @@ async function runFullBacktest() {
   }
 }
 
+async function runBacktestUpdate() {
+  loading.value = true;
+  try {
+    const res = await fetch("http://localhost:8003/backtest-update", {
+      method: "POST",
+    });
+    const data = await res.json();
+
+    if (data && data.stats) {
+      stats.value = data.stats;
+      backtestInfo.value = {
+        processedCount: (data.processed && data.processed.length) || 0,
+        skippedCount: (data.skipped && data.skipped.length) || 0,
+      };
+    }
+  } catch (e) {
+    console.error("Incremental backtest failed:", e);
+  } finally {
+    loading.value = false;
+  }
+}
+
+
 // ------------------------------------------
 // Run predictions with selected model
 // ------------------------------------------
@@ -96,9 +133,11 @@ async function runPredictions() {
     const data = await res.json();
 
     predictions.value = data.predictions || [];
+    enhanced.value = data.enhanced_rankings || [];
   } catch (e) {
     console.error("Prediction error:", e);
     predictions.value = [];
+    enhanced.value = [];
   } finally {
     loading.value = false;
   }
@@ -264,7 +303,6 @@ onMounted(() => {
   loadModels();
   (async () => {
     await loadStats();
-    await runFullBacktest();
   })();
 });
 </script>
@@ -340,14 +378,26 @@ onMounted(() => {
       <h3 class="text-lg font-semibold dark:text-gray-100">
         Stock Prediction Backtest
       </h3>
-      <button
-        @click="runFullBacktest"
-        :disabled="loading"
-        class="bg-purple-600 text-white px-4 py-2 rounded hover:bg-purple-700 disabled:opacity-50 text-sm"
-      >
-        {{ loading ? "Recomputing..." : "Recompute Backtest" }}
-      </button>
+
+      <div class="flex gap-2">
+        <button
+          @click="runBacktestUpdate"
+          :disabled="loading"
+          class="bg-green-600 text-white px-4 py-2 rounded hover:bg-green-700 disabled:opacity-50 text-sm"
+        >
+          {{ loading ? "Updating..." : "Update Backtest" }}
+        </button>
+
+        <button
+          @click="runFullBacktest"
+          :disabled="loading"
+          class="bg-purple-600 text-white px-4 py-2 rounded hover:bg-purple-700 disabled:opacity-50 text-sm"
+        >
+          {{ loading ? "Recomputing..." : "Recompute Backtest" }}
+        </button>
+      </div>
     </div>
+
 
     <p class="text-xs text-gray-400 mb-4">
       Processed {{ backtestInfo.processedCount }} file(s), skipped
@@ -455,6 +505,64 @@ onMounted(() => {
 
       </table>
     </div>
+
+    <h3 class="text-lg font-semibold mt-6 dark:text-gray-100">
+      Top 25 SmartRank Predictions
+    </h3>
+
+    <table v-if="enhanced.length" class="w-full text-sm mt-3 bg-gray-800 rounded">
+      <thead>
+        <tr class="border-b border-gray-700">
+          <th class="py-2 px-2">Symbol</th>
+          <th class="py-2 px-2">Action</th>
+          <th class="py-2 px-2">Confidence</th>
+          <th class="py-2 px-2">Hist. Acc</th>
+          <th class="py-2 px-2">Hist. PnL</th>
+          <th class="py-2 px-2">Recent Acc</th>
+          <th class="py-2 px-2">Recent PnL</th>
+          <th class="py-2 px-2 font-semibold">SmartRank</th>
+        </tr>
+      </thead>
+
+      <tbody>
+        <tr
+          v-for="r in enhanced"
+          :key="r.symbol"
+          class="border-b border-gray-700"
+        >
+          <td class="py-1 px-2">{{ r.symbol }}</td>
+          <td class="py-1 px-2">{{ r.action }}</td>
+          <td class="py-1 px-2">{{ r.confidence.toFixed(2) }}%</td>
+
+          <!-- Historical accuracy -->
+          <td class="py-1 px-2">
+            {{ r.historical_accuracy?.toFixed(2) ?? '—' }}%
+          </td>
+
+          <!-- Historical PnL -->
+          <td class="py-1 px-2">
+            {{ r.historical_pnl?.toFixed(2) ?? '—' }}%
+          </td>
+
+          <!-- Recent accuracy -->
+          <td class="py-1 px-2">
+            {{ r.recent_accuracy?.toFixed(2) ?? '—' }}%
+          </td>
+
+          <!-- Recent PnL -->
+          <td class="py-1 px-2">
+            {{ r.recent_pnl?.toFixed(2) ?? '—' }}%
+          </td>
+
+          <!-- Combined score -->
+          <td class="py-1 px-2 font-semibold">
+            {{ r.combined_score.toFixed(4) }}
+          </td>
+        </tr>
+      </tbody>
+    </table>
+
+
 
         <!-- Model Recommendations Results -->
     <h3 class="text-lg font-semibold mb-2 dark:text-gray-100">
