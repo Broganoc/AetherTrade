@@ -185,20 +185,42 @@ class ModelPredictor:
     # Predict many symbols + save log
     # -------------------------------------------------------------
     def batch_predict(self, symbols, lookback: int = 7, target_date: str = None):
-        results = []
+        # -------------------------------------------------------------
+        # 1. SIMPLE LOOKUP BEFORE DOING ANY WORK
+        # -------------------------------------------------------------
+        date_str = target_date if target_date else datetime.now().strftime("%Y-%m-%d")
+
+        # Determine model suffix (consistent with your log naming)
+        parts = self.model_path.stem.split("_")
+        if parts[-1] == "best":
+            model_suffix = f"{parts[-2]}_best"
+        else:
+            model_suffix = parts[-1]
+
+        # Expected log filename
+        log_filename = f"{date_str}_predictions_{model_suffix}.json"
+        log_path = self.log_dir / log_filename
+
+        # If cached file exists → load & return immediately
+        if log_path.exists():
+            try:
+                print(f"[Predictor] Using cached prediction file: {log_filename}")
+                return json.loads(log_path.read_text())
+            except Exception as e:
+                print(f"[Predictor] Failed to read cached file {log_filename}: {e}")
+                # fall back to computing new predictions
 
         # -------------------------------------------------------------
-        # Run predictions for all symbols
+        # 2. Compute predictions normally (same as before)
         # -------------------------------------------------------------
+        results = []
+
         for sym in symbols:
             try:
-                results.append(
-                    self.predict_symbol(sym, lookback, target_date=target_date)
-                )
+                results.append(self.predict_symbol(sym, lookback, target_date=target_date))
             except Exception as e:
                 print(f"[Predictor] Prediction failed for {sym}: {e}")
 
-        # Sort raw predictions (confidence only)
         results = sorted(results, key=lambda x: x["confidence"], reverse=True)
 
         # -------------------------------------------------------------
@@ -210,87 +232,87 @@ class ModelPredictor:
         recent_acc_map = {}
         recent_pnl_map = {}
 
-        RECENT_N = 20  # number of recent predictions to consider
+        RECENT_N = 20
 
-        model_key = self.model_path.name  # MUST include .zip to match stats.json
+        model_key = self.model_path.name  # e.g. ppo_agent_v1_AAPL.zip
+        legacy_key = self.model_path.stem  # e.g. ppo_agent_v1_AAPL
 
         if stats_path.exists():
             try:
                 data = json.loads(stats_path.read_text())
 
                 for symbol, sdata in data.items():
-                    if symbol == "_all_models":
+                    if symbol in ("_all_models", "_processed_files"):
+                        continue
+                    if not isinstance(sdata, dict):
                         continue
 
-                    # ----- Historical accuracy -----
+                    # --- Historical Accuracy ---
                     acc_table = sdata.get("model_accuracy", {})
-                    if model_key in acc_table:
-                        historical_acc[symbol] = float(acc_table[model_key])
+                    acc_val = acc_table.get(model_key, acc_table.get(legacy_key))
+                    if acc_val is not None:
+                        historical_acc[symbol] = float(acc_val)
 
-                    # ----- Historical pnl -----
+                    # --- Historical PnL ---
                     pnl_table = sdata.get("model_pnl", {})
-                    if model_key in pnl_table:
-                        historical_pnl[symbol] = float(pnl_table[model_key])
+                    pnl_val = pnl_table.get(model_key, pnl_table.get(legacy_key))
+                    if pnl_val is not None:
+                        historical_pnl[symbol] = float(pnl_val)
 
-                    # ----- Recency: last N recent entries -----
+                    # --- Recent Entries ---
                     entries = sdata.get("entries", [])
+                    if not isinstance(entries, list):
+                        continue
+
                     recent_entries = [
-                        e for e in entries
-                        if e["model"] == model_key
+                        e for e in entries if e.get("model") in (model_key, legacy_key)
                     ]
                     recent_entries = sorted(
                         recent_entries,
-                        key=lambda x: x["date"],
-                        reverse=True
+                        key=lambda x: x.get("date", ""),
+                        reverse=True,
                     )[:RECENT_N]
 
                     if recent_entries:
                         # recency accuracy
-                        recent_acc = sum(e["accuracy"] for e in recent_entries) / len(recent_entries)
+                        recent_acc = sum(e.get("accuracy", 0) for e in recent_entries) / len(recent_entries)
                         recent_acc_map[symbol] = recent_acc
 
-                        # recency pnl (raw)
-                        recent_pnl_raw = sum(e["pnl_pct"] for e in recent_entries) / len(recent_entries)
+                        # recency pnl
+                        recent_pnl_raw = sum(e.get("pnl_pct", 0) for e in recent_entries) / len(recent_entries)
                         recent_pnl_map[symbol] = recent_pnl_raw
 
             except Exception as e:
                 print(f"[SmartRank] Failed to load stats.json: {e}")
 
         # -------------------------------------------------------------
-        # SmartRank V3 (confidence + accuracy + pnl + recency)
+        # SmartRank V3
         # -------------------------------------------------------------
         enhanced = []
 
         for r in results:
             symbol = r["symbol"]
 
-            # ----- 1. Confidence -----
             conf = r["confidence"] / 100.0
-
-            # ----- 2. Historical accuracy -----
             acc = historical_acc.get(symbol, 0.50)
 
-            # ----- 3. Historical pnl -----
             pnl_raw = historical_pnl.get(symbol, 0.0)
             hist_pnl_scaled = (pnl_raw + 1.0) / 2.0
             hist_pnl_scaled = min(max(hist_pnl_scaled, 0.0), 1.0)
 
-            # ----- 4. Recency -----
             recent_acc = recent_acc_map.get(symbol, 0.50)
             recent_pnl_raw = recent_pnl_map.get(symbol, 0.0)
 
-            # normalize recency pnl
             scaled_recent_pnl = (recent_pnl_raw + 1.0) / 2.0
             scaled_recent_pnl = min(max(scaled_recent_pnl, 0.0), 1.0)
 
             recency_score = (0.65 * recent_acc) + (0.35 * scaled_recent_pnl)
 
-            # ----- SmartRank V3 -----
             combined = (
-                    (0.40 * conf) +
-                    (0.30 * acc) +
-                    (0.15 * hist_pnl_scaled) +
-                    (0.15 * recency_score)
+                    0.40 * conf
+                    + 0.30 * acc
+                    + 0.15 * hist_pnl_scaled
+                    + 0.15 * recency_score
             )
 
             enhanced.append({
@@ -303,35 +325,25 @@ class ModelPredictor:
             })
 
         # -------------------------------------------------------------
-        # Top-25 by SmartRank score
+        # Top 25
         # -------------------------------------------------------------
         enhanced_sorted = sorted(enhanced, key=lambda x: x["combined_score"], reverse=True)
         top_25 = enhanced_sorted[:25]
 
         # -------------------------------------------------------------
-        # Final output package
+        # Final output
         # -------------------------------------------------------------
         output = {
             "timestamp": datetime.utcnow().isoformat(),
             "model": self.model_path.stem,
-            "predictions": results,  # raw confidence sort
-            "enhanced_rankings": top_25,  # SmartRank Top-25
-            "all_scored": enhanced_sorted  # full ranked list for debugging
+            "predictions": results,
+            "enhanced_rankings": top_25,
+            "all_scored": enhanced_sorted,
         }
 
         # -------------------------------------------------------------
-        # Save log file
+        # Save file (since it’s new)
         # -------------------------------------------------------------
-        date_str = target_date if target_date else datetime.now().strftime("%Y-%m-%d")
-
-        parts = self.model_path.stem.split("_")
-        if parts[-1] == "best":
-            model_suffix = f"{parts[-2]}_best"
-        else:
-            model_suffix = parts[-1]
-
-        log_filename = f"{date_str}_predictions_{model_suffix}.json"
-        log_path = self.log_dir / log_filename
         latest_path = self.pred_dir / "latest.json"
 
         with open(log_path, "w") as f:
@@ -352,17 +364,21 @@ class ModelPredictor:
             parts = stem.split("_predictions_")
 
             if len(parts) == 2:
-                logs.append({
-                    "date": parts[0],
-                    "model": parts[1],
-                    "filename": f.name,
-                })
+                logs.append(
+                    {
+                        "date": parts[0],
+                        "model": parts[1],
+                        "filename": f.name,
+                    }
+                )
             else:
-                logs.append({
-                    "date": stem,
-                    "model": "unknown",
-                    "filename": f.name,
-                })
+                logs.append(
+                    {
+                        "date": stem,
+                        "model": "unknown",
+                        "filename": f.name,
+                    }
+                )
 
         return {"available": logs}
 
