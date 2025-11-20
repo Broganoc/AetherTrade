@@ -1,5 +1,6 @@
 <script setup>
-import { ref, onMounted, computed } from "vue";
+import { ref, onMounted, computed, watch, onBeforeUnmount } from "vue";
+import Chart from "chart.js/auto";
 
 /* ----------------------------------------------------
    Sorting State
@@ -308,7 +309,10 @@ const aggregated = computed(() => {
       g.confidences.reduce((a, b) => a + b, 0) / g.confidences.length;
 
     // Accuracy
-    const symStats = stats.value[symbol] || {};
+    const symStats = stats.value.symbols
+      ? stats.value.symbols[symbol] || {}
+      : stats.value[symbol] || {}; // support both shapes
+
     const rawAcc = symStats.model_accuracy || {};
 
     const perModelAcc = {};
@@ -386,6 +390,105 @@ const aggregated = computed(() => {
 });
 
 /* ----------------------------------------------------
+   Top-25 Position Accuracy (from stats.json)
+---------------------------------------------------- */
+const positionAccuracy = computed(() => {
+  const pa =
+    stats.value.position_accuracy && typeof stats.value.position_accuracy === "object"
+      ? stats.value.position_accuracy
+      : {};
+  const counts =
+    stats.value.position_counts && typeof stats.value.position_counts === "object"
+      ? stats.value.position_counts
+      : {};
+
+  const rows = [];
+  for (let i = 1; i <= 25; i++) {
+    const key = String(i);
+    const acc = pa[key];
+    const total = counts[key] ?? null;
+    rows.push({
+      rank: i,
+      acc: acc != null ? acc : null,
+      total,
+    });
+  }
+  return rows;
+});
+
+const hasPositionAccuracy = computed(() =>
+  positionAccuracy.value.some((r) => r.acc != null)
+);
+
+/* ----------------------------------------------------
+   Chart.js for position accuracy
+---------------------------------------------------- */
+const positionChartCanvas = ref(null);
+const positionChart = ref(null);
+
+function buildPositionChart() {
+  if (!positionChartCanvas.value) return;
+  const rows = positionAccuracy.value.filter((r) => r.acc != null);
+  if (!rows.length) return;
+
+  const labels = rows.map((r) => `#${r.rank}`);
+  const data = rows.map((r) => Number((r.acc * 100).toFixed(2)));
+
+  const ctx = positionChartCanvas.value.getContext("2d");
+  if (positionChart.value) {
+    positionChart.value.destroy();
+  }
+
+  positionChart.value = new Chart(ctx, {
+    type: "line",
+    data: {
+      labels,
+      datasets: [
+        {
+          label: "Accuracy by Rank (%)",
+          data,
+          tension: 0.3,
+        },
+      ],
+    },
+    options: {
+      responsive: true,
+      plugins: {
+        legend: {
+          display: false,
+        },
+      },
+      scales: {
+        y: {
+          beginAtZero: true,
+          max: 100,
+          ticks: {
+            callback: (value) => `${value}%`,
+          },
+        },
+      },
+    },
+  });
+}
+
+watch(
+  () => positionAccuracy.value,
+  () => {
+    if (hasPositionAccuracy.value) {
+      buildPositionChart();
+    }
+  },
+  { deep: true }
+);
+
+onBeforeUnmount(() => {
+  if (positionChart.value) {
+    positionChart.value.destroy();
+    positionChart.value = null;
+  }
+});
+
+/* ----------------------------------------------------
    Init
 ---------------------------------------------------- */
 onMounted(() => {
@@ -399,6 +502,55 @@ onMounted(() => {
     <h2 class="text-2xl font-semibold text-center mb-6 dark:text-gray-100">
       All Models – Consensus Signal Table
     </h2>
+
+    <!-- 🔝 Top-25 Position Accuracy -->
+    <div v-if="hasPositionAccuracy" class="mb-8">
+      <h3 class="text-xl font-semibold mb-4 text-center dark:text-gray-100">
+        Top-25 Recommendation Accuracy (Backtest)
+      </h3>
+
+      <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+        <!-- Chart -->
+        <div class="bg-gray-800 border border-gray-700 rounded-lg p-4 shadow">
+          <p class="text-sm text-gray-300 mb-2">
+            Accuracy curve by recommendation rank (1st = most preferred, 25th = lowest).
+          </p>
+          <canvas ref="positionChartCanvas"></canvas>
+        </div>
+
+        <!-- Table -->
+        <div class="bg-gray-800 border border-gray-700 rounded-lg p-4 shadow overflow-auto">
+          <table class="w-full text-sm text-gray-200">
+            <thead>
+              <tr class="border-b border-gray-700">
+                <th class="py-2 px-2 text-left">Rank</th>
+                <th class="py-2 px-2 text-left">Accuracy</th>
+                <th class="py-2 px-2 text-left">Samples</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr
+                v-for="row in positionAccuracy"
+                :key="row.rank"
+                class="border-b border-gray-700"
+              >
+                <td class="py-1 px-2">#{{ row.rank }}</td>
+                <td class="py-1 px-2">
+                  <span v-if="row.acc != null">
+                    {{ (row.acc * 100).toFixed(2) }}%
+                  </span>
+                  <span v-else>—</span>
+                </td>
+                <td class="py-1 px-2">
+                  <span v-if="row.total != null">{{ row.total }}</span>
+                  <span v-else>—</span>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
 
     <!-- Controls -->
     <div class="flex items-center gap-4 mb-6">

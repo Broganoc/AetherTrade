@@ -270,8 +270,7 @@ def backtest_all():
       - PnL estimated using Black-Scholes with synthetic 35→34 DTE option.
       - For each symbol+model+date, later files overwrite earlier records.
       - stats.json is overwritten each run.
-
-    All model names in stats are normalized to end with '.zip'.
+      - NEW: Adds global top-25 accuracy.
     """
     from shared.cache import load_price_on_date, load_cached_price_data
 
@@ -281,6 +280,15 @@ def backtest_all():
     stats: dict = {}
     processed: list[str] = []
     skipped: list[str] = []
+
+    # ------------------------------------
+    # NEW: TRACK POSITION ACCURACY
+    # ------------------------------------
+    position_correct = {i: 0 for i in range(1, 26)}
+    position_total   = {i: 0 for i in range(1, 26)}
+
+    # (model,symbol,date) → rank index in file
+    rank_lookup = {}   # {(model, symbol, date): rank}
 
     # ------------------------------------
     # Collect all prediction files
@@ -307,8 +315,6 @@ def backtest_all():
             skipped.append(fname)
             continue
 
-        print("DEBUG: loading file =", path)
-
         # --- Load JSON safely ---
         try:
             raw = json.loads(path.read_text())
@@ -316,7 +322,7 @@ def backtest_all():
             skipped.append(fname)
             continue
 
-        # Expect dict with "predictions" list + "model" key
+        # Validate predictions
         if isinstance(raw, dict) and "predictions" in raw:
             pred_list = raw["predictions"]
             header_model_name = raw.get("model", "unknown")
@@ -324,7 +330,7 @@ def backtest_all():
             skipped.append(fname)
             continue
 
-        # Normalize header model name to ALWAYS include .zip (except "unknown")
+        # Normalize model name to end with .zip
         if header_model_name and header_model_name != "unknown" and not header_model_name.endswith(".zip"):
             header_model_name = f"{header_model_name}.zip"
 
@@ -332,7 +338,7 @@ def backtest_all():
             skipped.append(fname)
             continue
 
-        # Determine the "file date" based on the first prediction
+        # Parse file date
         try:
             first_date_str = pred_list[0]["date"]
             file_date = datetime.strptime(first_date_str, "%Y-%m-%d").date()
@@ -340,7 +346,6 @@ def backtest_all():
             skipped.append(fname)
             continue
 
-        # Only consider files with completed market data
         if file_date >= yesterday:
             skipped.append(fname)
             continue
@@ -348,7 +353,21 @@ def backtest_all():
         processed.append(fname)
 
         # ------------------------------------
-        # Process each prediction in this file
+        # NEW: REGISTER RANK POSITIONS
+        # ------------------------------------
+        # Use list order as recommendation rank
+        for idx, p in enumerate(pred_list, start=1):
+            sym = p.get("symbol")
+            d = p.get("date")
+            m = p.get("model") or header_model_name
+            if not m.endswith(".zip"):
+                m = f"{m}.zip"
+            if sym and d:
+                # rank_lookup[(model,symbol,date)] = rank index
+                rank_lookup[(m, sym, d)] = idx
+
+        # ------------------------------------
+        # Evaluate each prediction in this file
         # ------------------------------------
         for p in pred_list:
             symbol = p.get("symbol")
@@ -358,19 +377,15 @@ def backtest_all():
             if not symbol or not action or not date_str:
                 continue
 
-            # Determine per-entry model name (normalize to .zip)
             entry_model_name = p.get("model") or header_model_name
             if entry_model_name and entry_model_name != "unknown" and not entry_model_name.endswith(".zip"):
                 entry_model_name = f"{entry_model_name}.zip"
 
-            # ----------------------------------------------------
-            # Shift evaluation date to next trading day: T+1
-            # ----------------------------------------------------
+            # T+1 evaluation
             try:
-                # Convert prediction date → next calendar day
                 target_date = (
-                        datetime.strptime(date_str, "%Y-%m-%d").date()
-                        + timedelta(days=1)
+                    datetime.strptime(date_str, "%Y-%m-%d").date()
+                    + timedelta(days=1)
                 ).strftime("%Y-%m-%d")
             except:
                 continue
@@ -381,7 +396,6 @@ def backtest_all():
             except Exception:
                 continue
 
-            # If market was closed or data missing, skip
             if row is None:
                 continue
 
@@ -392,15 +406,24 @@ def backtest_all():
 
             pct_change = (close_px - open_px) / open_px
 
-            # --- Intraday correctness ---
+            # Intraday correctness
             if action == "CALL":
                 correct = 1 if close_px > open_px else 0
             elif action == "PUT":
                 correct = 1 if close_px < open_px else 0
-            else:  # HOLD
+            else:
                 correct = 1 if abs(pct_change) < 0.0025 else 0
 
-            # --- PnL via simple Black-Scholes 35→34 DTE ---
+            # ------------------------------------
+            # NEW: POSITION ACCURACY TALLY
+            # ------------------------------------
+            rk = rank_lookup.get((entry_model_name, symbol, date_str))
+            if rk and 1 <= rk <= 25:
+                position_total[rk] += 1
+                if correct:
+                    position_correct[rk] += 1
+
+            # PnL calculation
             try:
                 strike = choose_strike(open_px, action)
 
@@ -416,16 +439,14 @@ def backtest_all():
 
                 sigma_est = max(0.05, min(2.0, sigma_est))
 
-                opt_open = black_scholes_price(open_px, strike, 35 / 365, 0.02, sigma_est, action)
-                opt_close = black_scholes_price(close_px, strike, 34 / 365, 0.02, sigma_est, action)
+                opt_open = black_scholes_price(open_px, strike, 35/365, 0.02, sigma_est, action)
+                opt_close = black_scholes_price(close_px, strike, 34/365, 0.02, sigma_est, action)
+                pnl_pct = (opt_close - opt_open)/opt_open if opt_open>0 else 0.0
 
-                pnl_pct = (opt_close - opt_open) / opt_open if opt_open > 0 else 0.0
             except Exception:
                 pnl_pct = 0.0
 
-            # ------------------------------------
-            # Aggregate into stats for this symbol
-            # ------------------------------------
+            # Aggregate into stats[symbol]
             if symbol not in stats or not isinstance(stats[symbol], dict):
                 stats[symbol] = {
                     "entries": [],
@@ -439,7 +460,7 @@ def backtest_all():
 
             sym_data = stats[symbol]
 
-            # Update earliest/latest date
+            # Update earliest/latest
             sym_data["earliest_date"] = min(sym_data["earliest_date"], date_str)
             sym_data["latest_date"] = max(sym_data["latest_date"], date_str)
 
@@ -448,7 +469,7 @@ def backtest_all():
                 entries = []
                 sym_data["entries"] = entries
 
-            # Overwrite if we already have this (symbol, model, date)
+            # Overwrite previous (model,date)
             existing = next(
                 (e for e in entries if e["date"] == date_str and e["model"] == entry_model_name),
                 None,
@@ -458,25 +479,19 @@ def backtest_all():
                 existing["accuracy"] = correct
                 existing["pnl_pct"] = pnl_pct
             else:
-                entries.append(
-                    {
-                        "date": date_str,
-                        "accuracy": correct,
-                        "pnl_pct": pnl_pct,
-                        "model": entry_model_name,
-                    }
-                )
+                entries.append({
+                    "date": date_str,
+                    "accuracy": correct,
+                    "pnl_pct": pnl_pct,
+                    "model": entry_model_name,
+                })
 
     # ------------------------------------
-    # Finalize aggregated stats per symbol
+    # Finalize per-symbol stats
     # ------------------------------------
     all_models_set = set()
 
     for symbol, data in stats.items():
-        # Skip metadata keys
-        if symbol in ("_processed_files", "_all_models"):
-            continue
-
         if not isinstance(data, dict):
             continue
 
@@ -485,55 +500,56 @@ def backtest_all():
             entries = []
             data["entries"] = entries
 
-        # Normalize legacy model names inside entries
+        # Normalize model names
+        normalized_entries = []
         for e in entries:
             m = e.get("model")
             if m and m != "unknown" and not m.endswith(".zip"):
                 m = f"{m}.zip"
                 e["model"] = m
-
-        # Overall metrics
-        acc_list = [e["accuracy"] for e in entries if "accuracy" in e]
-        pnl_list = [e["pnl_pct"] for e in entries if "pnl_pct" in e]
-
-        data["overall_accuracy"] = sum(acc_list) / len(acc_list) if acc_list else 0.0
-        data["overall_pnl"] = sum(pnl_list) / len(pnl_list) if pnl_list else 0.0
-
-        # --- Normalize model names inside entries & rebuild per-model groups ---
-        normalized_entries = []
-        for e in entries:
-            m = e.get("model")
-            if not m or m == "unknown":
-                continue
-
-            if not m.endswith(".zip"):
-                m = f"{m}.zip"
-                e["model"] = m
-
             normalized_entries.append(e)
-            all_models_set.add(m)
+            all_models_set.add(e["model"])
 
-        model_groups: dict[str, list[dict]] = {}
+        data["overall_accuracy"] = (
+            sum(e["accuracy"] for e in normalized_entries)
+            / len(normalized_entries)
+            if normalized_entries else 0.0
+        )
+
+        data["overall_pnl"] = (
+            sum(e["pnl_pct"] for e in normalized_entries)
+            / len(normalized_entries)
+            if normalized_entries else 0.0
+        )
+
+        # Per-model groups
+        model_groups = {}
         for e in normalized_entries:
-            m = e["model"]
-            model_groups.setdefault(m, []).append(e)
+            model_groups.setdefault(e["model"], []).append(e)
 
         data["model_accuracy"] = {
-            m: (sum(e["accuracy"] for e in lst) / len(lst))
-            for m, lst in model_groups.items()
+            m: sum(e["accuracy"] for e in lst) / len(lst) for m, lst in model_groups.items()
         }
-
         data["model_pnl"] = {
-            m: (sum(e["pnl_pct"] for e in lst) / len(lst))
-            for m, lst in model_groups.items()
+            m: sum(e["pnl_pct"] for e in lst) / len(lst) for m, lst in model_groups.items()
         }
 
-    # Root-level metadata for frontend / incremental update
-    stats["_all_models"] = sorted(list(all_models_set))
+    stats["_all_models"] = sorted(all_models_set)
     stats["_processed_files"] = sorted(processed)
 
     # ------------------------------------
-    # Atomic save to stats.json
+    # NEW: POSITION ACCURACY FINALIZATION
+    # ------------------------------------
+    stats["position_accuracy"] = {
+        str(i): (position_correct[i] / position_total[i]) if position_total[i] > 0 else None
+        for i in range(1, 26)
+    }
+    stats["position_counts"] = {
+        str(i): position_total[i] for i in range(1, 26)
+    }
+
+    # ------------------------------------
+    # Save to stats.json
     # ------------------------------------
     tmp_file = STATS_FILE.with_suffix(".json.tmp")
     tmp_file.write_text(json.dumps(stats, indent=2))
@@ -545,6 +561,7 @@ def backtest_all():
         "skipped": skipped,
         "stats": stats,
     }
+
 
 
 # ------------------------------------------------------------

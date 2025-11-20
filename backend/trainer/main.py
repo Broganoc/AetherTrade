@@ -216,3 +216,93 @@ def cancel_training():
     set_cancel_flag()
     return {"status": "cancel_requested"}
 
+
+from asyncio import sleep
+
+# ======================================================
+# Batch training helper
+# ======================================================
+
+async def run_full_train_on_all_non_best(
+    steps_per_round: int = 1_000_000,
+    chunks_per_round: int = 10,
+    eval_episodes: int = 5
+):
+    """
+    Sequentially run full_train_stream() on all models that do NOT contain 'best'.
+    Ensures each model trains one-at-a-time.
+    """
+
+    # Load model files
+    model_files = sorted(MODELS_DIR.glob("*.zip"))
+
+    # Filter out anything with "best" in the filename
+    models_to_train = [
+        f.name for f in model_files
+        if "best" not in f.stem.lower()
+    ]
+
+    print("=== MODELS TO TRAIN ===")
+    for m in models_to_train:
+        print(" -", m)
+    print("========================")
+
+    results = []
+
+    # Run models one-at-a-time
+    for model_file in models_to_train:
+        model_name = Path(model_file).name
+        print(f"\n\nStarting FULL TRAIN for: {model_name}\n")
+
+        # Launch streaming generator
+        gen = full_train_stream(
+            model_filename=model_name,
+            rounds=None,
+            steps_per_round=steps_per_round,
+            chunks_per_round=chunks_per_round,
+            eval_episodes=eval_episodes,
+        )
+
+        # Consume the generator until it's done
+        async for update in gen:
+            # Optional: print live updates
+            print(update.strip())
+
+            # Safety pause between SSE chunks
+            await sleep(0.01)
+
+        print(f"Finished FULL TRAIN for: {model_name}")
+        results.append(model_name)
+
+        # Cooldown to ensure cleanup
+        await sleep(2)
+
+    return results
+
+
+# ======================================================
+# API Endpoint: Train ALL non-best models
+# ======================================================
+@app.post("/train_all_non_best")
+async def train_all_non_best_endpoint(
+    steps_per_round: int = Query(1_000_000),
+    chunks_per_round: int = Query(10),
+    eval_episodes: int = Query(5)
+):
+    """
+    Trigger sequential full-training for all non-best models.
+    """
+    clear_cancel_flag()
+
+    trained = await run_full_train_on_all_non_best(
+        steps_per_round=steps_per_round,
+        chunks_per_round=chunks_per_round,
+        eval_episodes=eval_episodes
+    )
+
+    return {
+        "status": "completed",
+        "trained_models": trained,
+        "total": len(trained)
+    }
+
