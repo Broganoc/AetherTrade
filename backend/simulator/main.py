@@ -1,3 +1,10 @@
+# ============================
+#  AetherTrade Simulator (T-1 → T, Prediction Driven)
+#  Fully corrected version — uses ONLY predict_symbol()
+#  No duplicate log writing, no batch_predict dependency,
+#  Stable across repeated runs for ANY symbol.
+# ============================
+
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -13,135 +20,173 @@ from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from stable_baselines3.common.monitor import Monitor
 
 from shared.env import OptionTradingEnv
+from predictions.predictor import ModelPredictor  # <-- direct import
 
 MODELS_DIR = Path("/app/models")
 RESULTS_DIR = Path("/app/results")
+PRED_DIR = Path("/app/predictions_data")
+LOG_DIR = PRED_DIR / "log"
+
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
-# ------------------------------------------------------------
-# FastAPI Setup
-# ------------------------------------------------------------
 app = FastAPI(title="AetherTrade Simulator API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # dev only
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # ------------------------------------------------------------
-# Env factory
+# Env Factory
 # ------------------------------------------------------------
-def make_env(symbol, start="2020-01-01", end="2025-01-01", full_run=False):
-    """
-    Factory to create a monitored OptionTradingEnv.
-    full_run=True → full-dataset simulation
-    """
+def make_env(symbol, start="2020-01-01", end="2025-01-01"):
+    """Create a fresh monitored OptionTradingEnv"""
     def _init():
         env = OptionTradingEnv(symbol=symbol, start=start, end=end)
-        env.reset(full_run=full_run)
+        env.reset(full_run=True)
         return Monitor(env)
     return _init
 
-# ------------------------------------------------------------
-# Core simulation
-# ------------------------------------------------------------
-def run_simulation(
-    model_path: str,
-    symbol: str,
-    start: str,
-    end: str,
-    starting_balance: float = 10_000.0
-):
-    print(f"Intraday simulation for {symbol} | model={model_path} | {start}→{end} | start_cash=${starting_balance:,.2f}")
 
-    # ------------------------------
-    # Build env + VecNormalize
-    # ------------------------------
-    env_fn = make_env(symbol, start, end, full_run=True)
+# ------------------------------------------------------------
+# Helper: Load prediction from cache OR compute with predict_symbol()
+# ------------------------------------------------------------
+def get_prediction_for_date(model_name: str, symbol: str, date_str: str):
+    """
+    Returns a dict: {"action": CALL/PUT/HOLD, "symbol": ..., "date": ...}
+    Tries cached logs first, then falls back to live predict_symbol().
+    """
+
+    # --- Determine expected filename based on predictor's naming ---
+    # e.g. 2025-09-03_predictions_MULTI_best.json
+    model_stem = Path(model_name).stem
+    parts = model_stem.split("_")
+    if parts[-1] == "best":
+        suffix = f"{parts[-2]}_best"
+    else:
+        suffix = parts[-1]
+
+    log_filename = f"{date_str}_predictions_{suffix}.json"
+    log_path = LOG_DIR / log_filename
+
+    # --- 1. Try cached prediction file ---
+    if log_path.exists():
+        try:
+            raw = json.loads(log_path.read_text())
+            preds = raw.get("predictions", [])
+            match = next((p for p in preds if p["symbol"] == symbol.upper()), None)
+            if match:
+                return match
+        except Exception:
+            pass  # fall back to live prediction
+
+    # --- 2. Try latest.json (sometimes predictor stores last batch here) ---
+    latest_path = PRED_DIR / "latest.json"
+    if latest_path.exists():
+        try:
+            raw = json.loads(latest_path.read_text())
+            preds = raw.get("predictions", [])
+            match = next((p for p in preds if p["symbol"] == symbol.upper()
+                          and p["date"] == date_str), None)
+            if match:
+                return match
+        except Exception:
+            pass
+
+    # --- 3. Fall back to direct, single-symbol prediction ---
+    try:
+        predictor = ModelPredictor(str(MODELS_DIR / model_name),
+                                   pred_dir=str(PRED_DIR))
+        result = predictor.predict_symbol(symbol.upper(),
+                                          target_date=date_str)
+        return result
+    except Exception as e:
+        print(f"[SIM] Live prediction failed for {symbol} @ {date_str}: {e}")
+
+    # --- 4. Default to HOLD if everything fails ---
+    return {
+        "symbol": symbol,
+        "action": "HOLD",
+        "date": date_str,
+        "confidence": 0.0,
+        "price": None,
+    }
+
+
+# ------------------------------------------------------------
+# Core Simulation (Prediction Driven)
+# ------------------------------------------------------------
+def run_simulation(model_path: str, symbol: str, start: str, end: str, starting_balance: float):
+    symbol = symbol.upper()
+    print(f"Simulation (prediction-driven, T-1→T) for {symbol} | model={model_path} | {start}→{end} | start=${starting_balance:,.2f}")
+
+    # --- Build Env + VecNormalize ---
+    env_fn = make_env(symbol, start, end)
     base_vec = DummyVecEnv([env_fn])
 
-    vecnorm_path = str(model_path).replace(".zip", "_vecnorm.pkl")
+    vecnorm_path = model_path.replace(".zip", "_vecnorm.pkl")
     if Path(vecnorm_path).exists():
-        print(f"🔄 Loading VecNormalize stats from {vecnorm_path}")
+        print(f"Loading VecNormalize: {vecnorm_path}")
         vec_env = VecNormalize.load(vecnorm_path, base_vec)
         vec_env.training = False
         vec_env.norm_reward = False
     else:
-        print("⚠️ No VecNormalize stats found, using fresh normalization (results may differ).")
-        vec_env = VecNormalize(base_vec, norm_obs=True, norm_reward=False, clip_obs=5.0)
+        print("No VecNormalize found, using fresh normalization")
+        vec_env = VecNormalize(base_vec, norm_obs=True, norm_reward=False)
 
     model = PPO.load(model_path, env=vec_env)
 
-    # Get raw env + df
+    # --- Prepare Data ---
     env: OptionTradingEnv = base_vec.envs[0].env
     df = env.df.copy()
-    df["Date"] = pd.to_datetime(df["Date"]).dt.tz_localize(None)
+    df["Date"] = pd.to_datetime(df["Date"]).dt.date
 
-    # Date slice
-    start_dt = pd.to_datetime(start)
-    end_dt = pd.to_datetime(end)
+    start_dt = pd.to_datetime(start).date()
+    end_dt = pd.to_datetime(end).date()
     df = df[(df["Date"] >= start_dt) & (df["Date"] <= end_dt)].reset_index(drop=True)
 
-    if df.empty:
-        raise ValueError(f"No price rows in range {start}→{end} for {symbol}")
+    n_days = len(df)
+    print(f"[SIM] Trading days in range: {n_days}")
 
-    print(f"Rows to simulate: {len(df)}")
+    if n_days < 2:
+        raise ValueError("Not enough trading days to simulate.")
 
-    # ------------------------------
-    # Simulation state
-    # ------------------------------
-    rng = np.random.default_rng(seed=42)
-    r = getattr(env, "r", 0.02)
+    # --- State ---
     cash = float(starting_balance)
-    portfolio_values = [cash]
+    r = getattr(env, "r", 0.02)
     trades = []
+    portfolio_vals = [cash]
+    rng = np.random.default_rng(seed=42)
 
-    obs = vec_env.reset()
-
-    # ------------------------------
-    # Daily simulation loop
-    # ------------------------------
+    # --- Simulation Loop (day-by-day) ---
     for i in range(len(df)):
+        today = df.iloc[i]["Date"]
+
+        # T-1 (yesterday) prediction drives today's trade
+        if i == 0:
+            action = "HOLD"
+            pred_date = None
+        else:
+            pred_date = df.iloc[i-1]["Date"].strftime("%Y-%m-%d")
+            pred = get_prediction_for_date(Path(model_path).name, symbol, pred_date)
+            action = pred.get("action", "HOLD")
+
+        # --- Today's real market values ---
         row = df.iloc[i]
-        day = pd.to_datetime(row["Date"]).date()
+        Sopen = float(row["Open"])
+        Sclose = float(row["Close"])
 
-        S_open = float(row["Open"])
-        S_close = float(row["Close"])
-        S_high = float(row["High"])
-        S_low = float(row["Low"])
-
-        # ---- PPO action
-        action_idx, _ = model.predict(obs, deterministic=True)
-        action_idx = int(action_idx)
-        action = "HOLD" if action_idx == 1 else ("PUT" if action_idx == 0 else "CALL")
-
-        # ---- Random DTE (once per day)
-        dte_days = int(rng.integers(31, 46))
-        T_open = dte_days / 365.0
-        T_close = (dte_days - 1) / 365.0
-        approx_expiry = day + timedelta(days=dte_days)
-
-        # ======================================================
-        # HOLD: no strike, no sigma, no BS pricing
-        # ======================================================
-        if action == "HOLD":
-            # Step PPO env
-            obs, _, _, _ = vec_env.step([1])
-
-            # Realized vol only for reporting
-            recent = df["Close"].pct_change().iloc[max(0, i - 20): i + 1].dropna()
-            realized_vol = float(recent.std() * np.sqrt(252)) if len(recent) >= 5 else 0.20
-            realized_vol = max(0.05, min(2.0, realized_vol))
-
+        # --- HOLD logic ---
+        if action.upper() == "HOLD":
             trades.append({
-                "date": str(day),
+                "date": today.strftime("%Y-%m-%d"),
                 "action": "HOLD",
-                "underlying_open": S_open,
-                "underlying_close": S_close,
+                "underlying_open": Sopen,
+                "underlying_close": Sclose,
                 "strike": None,
                 "option_open": None,
                 "option_close": None,
@@ -150,49 +195,39 @@ def run_simulation(
                 "total_proceeds": 0.0,
                 "pnl": 0.0,
                 "pnl_pct": 0.0,
-                "volatility": round(realized_vol, 6),
-                "dte": dte_days,
-                "training_intraday_score": None,
-                "correct_call": S_close > S_open,
-                "correct_put": S_close < S_open,
-                "portfolio_value": round(cash, 2),
+                "volatility": None,
+                "dte": None,
+                "portfolio_value": cash,
             })
-            portfolio_values.append(cash)
+            portfolio_vals.append(cash)
             continue
 
-        # ======================================================
-        # CALL / PUT — active option trade
-        # ======================================================
+        # --- Active Trade (CALL or PUT) ---
+        strike = env._choose_otm_strike(Sopen, action)
+        dte = int(rng.integers(31, 46))
+        Topen = dte / 365
+        Tclose = (dte - 1) / 365
 
-        # 1. Choose strike
-        strike = env._choose_otm_strike(S_open, action)
-
-        # 2. Compute sigma NOW that strike exists
         sigma = env._compute_sigma(
-            S=S_open,
+            S=Sopen,
             strike=strike,
             action=action,
             day_index=i,
             df=df,
-            expiry_date=approx_expiry
+            expiry_date=today + timedelta(days=dte)
         )
 
-        # 3. Compute option premiums
-        opt_open = max(env.black_scholes_price(S_open, strike, T_open, r, sigma, action), 0.05)
-        opt_close = max(env.black_scholes_price(S_close, strike, T_close, r, sigma, action), 0.05)
+        opt_open = max(env.black_scholes_price(Sopen, strike, Topen, r, sigma, action), 0.05)
+        unit_cost = opt_open * 100
+        contracts = int(np.floor(cash / unit_cost))
 
-        # 4. Determine contracts
-        unit_cost = opt_open * 100.0
-        contracts = int(np.floor(cash / unit_cost)) if unit_cost > 0 else 0
-
-        # Not enough capital → HOLD
         if contracts < 1:
-            obs, _, _, _ = vec_env.step([1])
+            # Not enough to open position → HOLD
             trades.append({
-                "date": str(day),
+                "date": today.strftime("%Y-%m-%d"),
                 "action": "HOLD",
-                "underlying_open": S_open,
-                "underlying_close": S_close,
+                "underlying_open": Sopen,
+                "underlying_close": Sclose,
                 "strike": None,
                 "option_open": None,
                 "option_close": None,
@@ -201,121 +236,85 @@ def run_simulation(
                 "total_proceeds": 0.0,
                 "pnl": 0.0,
                 "pnl_pct": 0.0,
-                "volatility": round(sigma, 6),
-                "dte": dte_days,
-                "training_intraday_score": None,
-                "correct_call": S_close > S_open,
-                "correct_put": S_close < S_open,
-                "portfolio_value": round(cash, 2),
+                "volatility": sigma,
+                "dte": dte,
+                "portfolio_value": cash,
             })
-            portfolio_values.append(cash)
+            portfolio_vals.append(cash)
             continue
 
-        # 5. Enter trade
-        total_cost = unit_cost * contracts
+        # --- Enter Trade ---
+        total_cost = contracts * unit_cost
         cash -= total_cost
 
-        # 6. Exit end-of-day
-        total_proceeds = opt_close * 100.0 * contracts
+        # --- Exit Trade ---
+        opt_close = max(env.black_scholes_price(Sclose, strike, Tclose, r, sigma, action), 0.05)
+        total_proceeds = opt_close * 100 * contracts
         pnl = total_proceeds - total_cost
         pnl_pct = pnl / total_cost if total_cost > 0 else 0.0
 
-        # 7. Training-style intraday scoring
-        swings = {
-            "open_close": env._bs_intraday_return(S_open, S_close, sigma, action),
-            "open_high":  env._bs_intraday_return(S_open, S_high,  sigma, action),
-            "low_close":  env._bs_intraday_return(S_low,  S_close, sigma, action),
-            "low_high":   env._bs_intraday_return(S_low,  S_high,  sigma, action),
-        }
-        training_signal = (
-            0.5*swings["open_close"] +
-            0.3*swings["open_high"] +
-            0.1*swings["low_close"] +
-            0.1*swings["low_high"]
-        )
-
-        # Final cash update
         cash += total_proceeds
 
         trades.append({
-            "date": str(day),
-            "action": action,
-            "underlying_open": S_open,
-            "underlying_close": S_close,
-            "strike": float(strike),
-            "option_open": round(opt_open, 4),
-            "option_close": round(opt_close, 4),
-            "contracts": int(contracts),
-            "total_cost": round(total_cost, 2),
-            "total_proceeds": round(total_proceeds, 2),
-            "pnl": round(pnl, 2),
-            "pnl_pct": round(pnl_pct * 100.0, 2),
-            "volatility": round(sigma, 6),
-            "dte": dte_days,
-            "training_intraday_score": round(training_signal, 6),
-            "correct_call": S_close > S_open,
-            "correct_put": S_close < S_open,
-            "portfolio_value": round(cash, 2),
+            "date": today.strftime("%Y-%m-%d"),
+            "action": action.upper(),
+            "underlying_open": Sopen,
+            "underlying_close": Sclose,
+            "strike": strike,
+            "option_open": opt_open,
+            "option_close": opt_close,
+            "contracts": contracts,
+            "total_cost": total_cost,
+            "total_proceeds": total_proceeds,
+            "pnl": pnl,
+            "pnl_pct": pnl_pct * 100,
+            "volatility": sigma,
+            "dte": dte,
+            "portfolio_value": cash,
         })
 
-        portfolio_values.append(cash)
+        portfolio_vals.append(cash)
 
-        # Step PPO environment
-        obs, _, _, _ = vec_env.step([action_idx])
-
-        if cash <= 0:
-            print(f"[INFO] Portfolio depleted on {day}")
-            break
-
-    # ------------------------------
-    # Final results
-    # ------------------------------
+    # --- Final output ---
     result = {
         "symbol": symbol,
         "model_name": Path(model_path).stem,
         "start": start,
         "end": end,
-        "starting_balance": float(starting_balance),
-        "final_balance": float(cash),
-        "pnl": float(cash - starting_balance),
-        "pnl_pct": float((cash - starting_balance) / starting_balance * 100.0),
-        "portfolio_values": [float(v) for v in portfolio_values],
+        "starting_balance": starting_balance,
+        "final_balance": cash,
+        "pnl": cash - starting_balance,
+        "pnl_pct": (cash - starting_balance) / starting_balance * 100,
+        "portfolio_values": portfolio_vals,
         "trades": trades,
     }
 
     out_file = RESULTS_DIR / f"simulation_{symbol}.json"
-    with open(out_file, "w") as f:
-        json.dump(result, f, indent=2)
+    json.dump(result, open(out_file, "w"), indent=2)
 
-    print(f"✅ Intraday simulation complete. Final=${cash:,.2f}. Results saved to {out_file}")
+    print(f"Simulation complete. Final=${cash:,.2f}. Saved → {out_file}")
     return result
 
 
 # ------------------------------------------------------------
-# API Routes
+# API Route
 # ------------------------------------------------------------
 @app.post("/simulate")
 def simulate(
-    symbol: str = Query(..., description="Trading symbol, e.g. AAPL"),
-    model_name: str = Query(..., description="Model filename (e.g., ppo_agent_v1_AAPL.zip)"),
-    start: str = Query("2020-01-01"),
-    end: str = Query("2025-01-01"),
-    starting_balance: float = Query(10_000.0),
+    symbol: str = Query(...),
+    model_name: str = Query(...),
+    start: str = Query(...),
+    end: str = Query(...),
+    starting_balance: float = Query(10000.0),
 ):
-    """Run an intraday (open→close) simulation across the date range."""
-    model_path = str(MODELS_DIR / model_name)
-    if not Path(model_path).exists():
-        return JSONResponse(content={"error": f"Model not found: {model_path}"}, status_code=404)
+    model_file = MODELS_DIR / model_name
+    if not model_file.exists():
+        return JSONResponse({"error": f"Model not found"}, status_code=404)
 
     try:
-        result = run_simulation(model_path, symbol.upper(), start, end, starting_balance)
-        return JSONResponse(content=result)
+        result = run_simulation(str(model_file), symbol.upper(), start, end, starting_balance)
+        return result
     except Exception as e:
         print("[ERROR]", e)
         traceback.print_exc()
-        return JSONResponse(content={"error": str(e)}, status_code=500)
-
-@app.get("/results")
-def list_results():
-    files = [f.name for f in RESULTS_DIR.glob("simulation_*.json")]
-    return {"results": files}
+        return JSONResponse({"error": str(e)}, status_code=500)

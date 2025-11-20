@@ -98,7 +98,8 @@ def save_stats(stats):
 # ------------------------------------------------------------
 def get_predictor(model_name: str) -> ModelPredictor:
     """
-    model_name is expected WITHOUT .zip.
+    model_name is expected WITHOUT .zip (e.g. 'ppo_agent_v1_AAPL').
+    Stats will always store the canonical key WITH '.zip'.
     """
     global predictor_instance
     model_path = MODELS_DIR / f"{model_name}.zip"
@@ -269,6 +270,8 @@ def backtest_all():
       - PnL estimated using Black-Scholes with synthetic 35→34 DTE option.
       - For each symbol+model+date, later files overwrite earlier records.
       - stats.json is overwritten each run.
+
+    All model names in stats are normalized to end with '.zip'.
     """
     from shared.cache import load_price_on_date, load_cached_price_data
 
@@ -316,14 +319,14 @@ def backtest_all():
         # Expect dict with "predictions" list + "model" key
         if isinstance(raw, dict) and "predictions" in raw:
             pred_list = raw["predictions"]
-            model_name = raw.get("model", "unknown")
+            header_model_name = raw.get("model", "unknown")
         else:
             skipped.append(fname)
             continue
 
-        # Normalize model name to ALWAYS include .zip (except "unknown")
-        if model_name and model_name != "unknown" and not model_name.endswith(".zip"):
-            model_name = f"{model_name}.zip"
+        # Normalize header model name to ALWAYS include .zip (except "unknown")
+        if header_model_name and header_model_name != "unknown" and not header_model_name.endswith(".zip"):
+            header_model_name = f"{header_model_name}.zip"
 
         if not isinstance(pred_list, list) or not pred_list:
             skipped.append(fname)
@@ -355,12 +358,30 @@ def backtest_all():
             if not symbol or not action or not date_str:
                 continue
 
-            # --- Load market data for that date ---
+            # Determine per-entry model name (normalize to .zip)
+            entry_model_name = p.get("model") or header_model_name
+            if entry_model_name and entry_model_name != "unknown" and not entry_model_name.endswith(".zip"):
+                entry_model_name = f"{entry_model_name}.zip"
+
+            # ----------------------------------------------------
+            # Shift evaluation date to next trading day: T+1
+            # ----------------------------------------------------
             try:
-                row = load_price_on_date(symbol, date_str)
+                # Convert prediction date → next calendar day
+                target_date = (
+                        datetime.strptime(date_str, "%Y-%m-%d").date()
+                        + timedelta(days=1)
+                ).strftime("%Y-%m-%d")
+            except:
+                continue
+
+            # Load T+1 data
+            try:
+                row = load_price_on_date(symbol, target_date)
             except Exception:
                 continue
 
+            # If market was closed or data missing, skip
             if row is None:
                 continue
 
@@ -384,7 +405,7 @@ def backtest_all():
                 strike = choose_strike(open_px, action)
 
                 hist = load_cached_price_data(symbol)
-                cutoff = pd.Timestamp(date_str)
+                cutoff = pd.Timestamp(target_date)
                 hist = hist[hist["Date"] <= cutoff]
 
                 returns = hist["Close"].pct_change().dropna().tail(60)
@@ -429,7 +450,7 @@ def backtest_all():
 
             # Overwrite if we already have this (symbol, model, date)
             existing = next(
-                (e for e in entries if e["date"] == date_str and e["model"] == model_name),
+                (e for e in entries if e["date"] == date_str and e["model"] == entry_model_name),
                 None,
             )
 
@@ -442,7 +463,7 @@ def backtest_all():
                         "date": date_str,
                         "accuracy": correct,
                         "pnl_pct": pnl_pct,
-                        "model": model_name,
+                        "model": entry_model_name,
                     }
                 )
 
@@ -478,14 +499,24 @@ def backtest_all():
         data["overall_accuracy"] = sum(acc_list) / len(acc_list) if acc_list else 0.0
         data["overall_pnl"] = sum(pnl_list) / len(pnl_list) if pnl_list else 0.0
 
-        # Per-model metrics
-        model_groups: dict[str, list[dict]] = {}
+        # --- Normalize model names inside entries & rebuild per-model groups ---
+        normalized_entries = []
         for e in entries:
             m = e.get("model")
             if not m or m == "unknown":
                 continue
-            model_groups.setdefault(m, []).append(e)
+
+            if not m.endswith(".zip"):
+                m = f"{m}.zip"
+                e["model"] = m
+
+            normalized_entries.append(e)
             all_models_set.add(m)
+
+        model_groups: dict[str, list[dict]] = {}
+        for e in normalized_entries:
+            m = e["model"]
+            model_groups.setdefault(m, []).append(e)
 
         data["model_accuracy"] = {
             m: (sum(e["accuracy"] for e in lst) / len(lst))
@@ -629,6 +660,8 @@ def backtest_update():
     """
     Incrementally update stats.json by processing only new prediction files.
     Safe version — skips metadata keys, validates structures, and prevents crashes.
+
+    All model names in stats are normalized to end with '.zip'.
     """
     from shared.cache import load_price_on_date, load_cached_price_data
 
@@ -692,14 +725,14 @@ def backtest_update():
         # --- Determine prediction list + model name ---
         if isinstance(raw, dict) and "predictions" in raw:
             pred_list = raw["predictions"]
-            model_name = raw.get("model", "unknown")
+            header_model_name = raw.get("model", "unknown")
         else:
             skipped.append(fname)
             continue  # must match expected schema
 
-        # Normalize model name to ALWAYS include .zip (except "unknown")
-        if model_name and model_name != "unknown" and not model_name.endswith(".zip"):
-            model_name = f"{model_name}.zip"
+        # Normalize header model name to ALWAYS include .zip (except "unknown")
+        if header_model_name and header_model_name != "unknown" and not header_model_name.endswith(".zip"):
+            header_model_name = f"{header_model_name}.zip"
 
         if not isinstance(pred_list, list):
             skipped.append(fname)
@@ -735,12 +768,31 @@ def backtest_update():
             if not symbol or not action or not date_str:
                 continue
 
-            # --- Load market data ---
+            # Determine per-entry model name (normalize to .zip)
+            entry_model_name = p.get("model") or header_model_name
+            if entry_model_name and entry_model_name != "unknown" and not entry_model_name.endswith(".zip"):
+                entry_model_name = f"{entry_model_name}.zip"
+
+            # ----------------------------------------------------
+            # Shift evaluation date to next trading day: T+1
+            # ----------------------------------------------------
             try:
-                row = load_price_on_date(symbol, date_str)
-                if row is None:
-                    continue
+                # Convert prediction date → next calendar day
+                target_date = (
+                        datetime.strptime(date_str, "%Y-%m-%d").date()
+                        + timedelta(days=1)
+                ).strftime("%Y-%m-%d")
+            except:
+                continue
+
+            # Load T+1 data
+            try:
+                row = load_price_on_date(symbol, target_date)
             except Exception:
+                continue
+
+            # If market was closed or data missing, skip
+            if row is None:
                 continue
 
             open_px = float(row["Open"])
@@ -762,7 +814,7 @@ def backtest_update():
             try:
                 strike = choose_strike(open_px, action)
                 hist = load_cached_price_data(symbol)
-                cutoff = pd.Timestamp(date_str)
+                cutoff = pd.Timestamp(target_date)
                 hist = hist[hist["Date"] <= cutoff]
 
                 returns = hist["Close"].pct_change().dropna().tail(60)
@@ -807,7 +859,7 @@ def backtest_update():
                 sym_data["entries"] = entries
 
             existing = next(
-                (e for e in entries if e["date"] == date_str and e["model"] == model_name),
+                (e for e in entries if e["date"] == date_str and e["model"] == entry_model_name),
                 None,
             )
 
@@ -820,7 +872,7 @@ def backtest_update():
                         "date": date_str,
                         "accuracy": correct,
                         "pnl_pct": pnl_pct,
-                        "model": model_name,
+                        "model": entry_model_name,
                     }
                 )
 
@@ -857,14 +909,24 @@ def backtest_update():
         data["overall_accuracy"] = sum(acc_list) / len(acc_list) if acc_list else 0.0
         data["overall_pnl"] = sum(pnl_list) / len(pnl_list) if pnl_list else 0.0
 
-        # --- Per-model stats ---
-        model_groups = {}
+        # --- Normalize model names inside entries & rebuild per-model groups ---
+        normalized_entries = []
         for e in entries:
             m = e.get("model")
             if not m or m == "unknown":
                 continue
-            model_groups.setdefault(m, []).append(e)
+
+            if not m.endswith(".zip"):
+                m = f"{m}.zip"
+                e["model"] = m
+
+            normalized_entries.append(e)
             all_models_set.add(m)
+
+        model_groups: dict[str, list[dict]] = {}
+        for e in normalized_entries:
+            m = e["model"]
+            model_groups.setdefault(m, []).append(e)
 
         data["model_accuracy"] = {
             m: sum(e["accuracy"] for e in lst) / len(lst) for m, lst in model_groups.items()
