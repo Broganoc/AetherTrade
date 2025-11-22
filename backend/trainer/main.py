@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pathlib import Path
 from datetime import date
-import json
+import json, tempfile, os
 
 from trainer.train import (
     train_agent_stream,
@@ -11,7 +11,8 @@ from trainer.train import (
     full_train_stream,
     train_agent,
     set_cancel_flag,
-    clear_cancel_flag
+    clear_cancel_flag,
+    atomic_save_file
 )
 
 MODELS_DIR = Path("/app/models")
@@ -74,6 +75,44 @@ def get_trained_models():
         })
 
     return models
+
+def atomic_write_json(path: Path, data: dict):
+    """
+    Write a JSON metadata file using the SAME atomic save mechanism
+    used for model saving.
+    """
+    # Convert JSON to bytes
+    raw = json.dumps(data, indent=2).encode("utf-8")
+
+    # Use your existing atomic file helper
+    atomic_save_file(path, raw)
+
+def update_model_json(json_path: Path, update_fn=None):
+    try:
+        meta = json.loads(json_path.read_text())
+    except:
+        meta = {}
+
+    if update_fn:
+        meta = update_fn(meta) or meta
+
+    meta["manual_update_timestamp"] = time.time()
+
+    atomic_write_json(json_path, meta)
+    return meta
+
+def update_all_model_jsons(update_fn=None):
+    json_files = list(MODELS_DIR.glob("*.json"))
+    updated = []
+
+    for jf in json_files:
+        try:
+            new_meta = update_model_json(jf, update_fn)
+            updated.append({"file": jf.name, "meta": new_meta})
+        except Exception as e:
+            updated.append({"file": jf.name, "error": str(e)})
+
+    return updated
 
 
 # ======================================================
@@ -306,3 +345,12 @@ async def train_all_non_best_endpoint(
         "total": len(trained)
     }
 
+
+@app.post("/update_all_jsons")
+def update_all_jsons_endpoint():
+    updated = update_all_model_jsons()
+    return {
+        "status": "ok",
+        "updated_count": len(updated),
+        "details": updated
+    }

@@ -217,6 +217,35 @@ def _save_metadata(path: Path, data: dict):
         print("[ERROR] Data attempting to write:", json.dumps(data, indent=2))
         raise
 
+def _update_json_during_full_train(model_path: Path,
+                                   stats: dict,
+                                   val_mean: Optional[float],
+                                   val_std: Optional[float],
+                                   round_idx: int,
+                                   chunk_idx: Optional[int] = None):
+    """
+    Lightweight metadata update that runs during full_train whenever
+    the model+vecnorm are saved. Does NOT overwrite history or best fields.
+    """
+    meta_path = model_path.with_suffix(".json")
+    meta = _load_metadata(meta_path)
+
+    # update lightweight fields only
+    meta["last_training_timestamp"] = _utc_now_iso()
+    meta["metrics"] = {
+        "mean_reward": stats.get("mean_reward"),
+        "mean_episode_length": stats.get("mean_episode_length"),
+        "validation_mean_reward": float(val_mean) if val_mean is not None else meta.get("metrics", {}).get("validation_mean_reward"),
+        "validation_std": float(val_std) if val_std is not None else meta.get("metrics", {}).get("validation_std"),
+    }
+
+    meta["progress"] = {
+        "round": round_idx,
+        "chunk": chunk_idx,
+    }
+
+    _save_metadata(meta_path, meta)
+
 
 def _current_hyperparams_snapshot(model: PPO) -> dict:
     """
@@ -815,6 +844,14 @@ async def full_train_stream(model_filename: str,
                 # periodic save within the round
                 if (i + 1) % save_every_chunks == 0:
                     await safe_save_model_and_vecnorm(model, env, model_path)
+                    _update_json_during_full_train(
+                        model_path=model_path,
+                        stats=stats,
+                        val_mean=val_mean,
+                        val_std=val_std,
+                        round_idx=round_idx,
+                        chunk_idx=i + 1
+                    )
 
                 # Progress is per-round (0-100)
                 progress = int(((i + 1) / chunks_per_round) * 100)
@@ -854,7 +891,18 @@ async def full_train_stream(model_filename: str,
             losses = _extract_losses(model)
 
             # Always save at round end
+            # Always save at round end
             await safe_save_model_and_vecnorm(model, env, model_path)
+
+            # Update JSON at round end too
+            _update_json_during_full_train(
+                model_path=model_path,
+                stats=stats,
+                val_mean=final_val_mean,
+                val_std=final_val_std,
+                round_idx=round_idx,
+                chunk_idx=None
+            )
 
             # Save best by validation reward
             improved = (final_val_mean is not None) and (final_val_mean > best_val_reward)
@@ -1105,3 +1153,4 @@ def _finalize_fulltrain_metadata(
         best_meta = dict(meta)
         best_meta["note"] = "Best-by-validation checkpoint"
         _save_metadata(model_path.with_name(model_path.stem + "_best.json"), best_meta)
+
