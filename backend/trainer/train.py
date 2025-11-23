@@ -720,7 +720,7 @@ async def full_train_stream(model_filename: str,
                             steps_per_round: int = 1_000_000,
                             chunks_per_round: int = 10,
                             eval_episodes: int = 5,
-                            save_every_chunks: int = 5,
+                            save_every_chunks: int = 2,
                             wallclock_limit_hours: Optional[float] = None):
     """
     Runs repeated resume-training *indefinitely* (until early-stop triggers).

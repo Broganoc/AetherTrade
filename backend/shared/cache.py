@@ -1,161 +1,165 @@
 from pathlib import Path
 import pandas as pd
 import yfinance as yf
-from datetime import datetime, date, timedelta
+from datetime import date, timedelta
 
 CACHE_DIR = Path("/app/stock_data")
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # ======================================================
-# CLEANING
+# INTERNAL HELPERS
 # ======================================================
-def _clean_yahoo_df(df: pd.DataFrame):
-    if df is None or df.empty:
+
+def _clean_yahoo_df(raw: pd.DataFrame) -> pd.DataFrame:
+    if raw is None or raw.empty:
         return pd.DataFrame()
 
-    # Flatten if multiindex
+    df = raw.copy()
+
+    # ---- Fix MultiIndex columns (common on dividends/splits)
     if isinstance(df.columns, pd.MultiIndex):
-        df.columns = ["_".join(col).strip() for col in df.columns]
+        df.columns = [c[0] for c in df.columns]
 
-    # Ensure Date exists
+    # ---- Ensure a real Date column & no Date as index
+    if isinstance(df.index, pd.DatetimeIndex):
+        df = df.reset_index()                      # index -> column named "index"
+        df = df.rename(columns={"index": "Date"})  # rename to Date
+
+    # Fallback if Date already existed as a normal column
     if "Date" not in df.columns:
-        if isinstance(df.index, pd.DatetimeIndex):
-            df = df.copy()
-            df["Date"] = df.index
-            df.reset_index(drop=True, inplace=True)
-        else:
-            # Try fallback date column
-            for col in df.columns:
-                if "date" in col.lower():
-                    df.rename(columns={col: "Date"}, inplace=True)
-                    break
+        for col in df.columns:
+            if col.lower() == "date":
+                df = df.rename(columns={col: "Date"})
+                break
 
     if "Date" not in df.columns:
-        return pd.DataFrame()
+        raise ValueError("No Date column present in cleaned Yahoo DF.")
 
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-    df.dropna(subset=["Date"], inplace=True)
+    df = df.dropna(subset=["Date"])
 
-    # Rename common columns gracefully
-    rename_map = {}
-    for col in df.columns:
-        c = col.lower()
-        if "open" in c: rename_map[col] = "Open"
-        if "high" in c: rename_map[col] = "High"
-        if "low" in c: rename_map[col] = "Low"
-        if "close" in c and "adj" not in c: rename_map[col] = "Close"
-        if "adj" in c and "close" in c: rename_map[col] = "Adj Close"
-        if "volume" in c: rename_map[col] = "Volume"
+    # ---- Drop Adj Close (we never use it)
+    if "Adj Close" in df.columns:
+        df = df.drop(columns=["Adj Close"])
 
-    df.rename(columns=rename_map, inplace=True)
+    # ---- Required columns
+    expected = ["Open", "High", "Low", "Close", "Volume"]
+    for col in expected:
+        if col not in df.columns:
+            raise ValueError(f"Missing required Yahoo column: {col}")
 
-    # If both close+adj close, prefer normal close
-    if "Adj Close" in df.columns and "Close" in df.columns:
-        df.drop(columns=["Adj Close"], inplace=True)
-    elif "Adj Close" in df.columns and "Close" not in df.columns:
-        df.rename(columns={"Adj Close": "Close"}, inplace=True)
+    # ---- Final cleaning
+    df = df.sort_values("Date").reset_index(drop=True)
 
     return df
 
 
-# ======================================================
-# REFRESH FULL HISTORY (only when necessary)
-# ======================================================
-def refresh_and_load(symbol: str):
-    today = date.today().strftime("%Y-%m-%d")
 
-    df = yf.download(
+def _download_yahoo(symbol: str, start: str, end: str) -> pd.DataFrame:
+    """
+    Wrapper around yfinance download that ensures:
+    - correct date ranges
+    - no auto-adjusted prices
+    - correct cleaned output
+    """
+    raw = yf.download(
         symbol,
-        start="2010-01-01",
-        end=today,
+        start=start,
+        end=end,
         auto_adjust=False,
         progress=False,
     )
+    if raw is None or raw.empty:
+        return pd.DataFrame()
 
-    if df is None or df.empty:
-        raise ValueError(f"Yahoo returned empty dataset for full refresh: {symbol}")
+    return _clean_yahoo_df(raw)
 
-    df = _clean_yahoo_df(df)
 
+# ======================================================
+# PUBLIC API
+# ======================================================
+
+def refresh_and_load(symbol: str) -> pd.DataFrame:
+    """
+    Completely rewrite cache for this symbol.
+    Downloads all data from 2010 → today.
+    """
+    today = date.today().strftime("%Y-%m-%d")
+    start = "2010-01-01"
+
+    df = _download_yahoo(symbol, start, today)
     if df.empty:
-        raise ValueError(f"Cleaned dataframe empty after refresh: {symbol}")
+        raise ValueError(f"Yahoo returned empty dataset for refresh: {symbol}")
 
+    # Save
     out_path = CACHE_DIR / f"{symbol}.csv"
     df.to_csv(out_path, index=False)
 
     return df
 
 
-# ======================================================
-# LOAD CACHE (minimally touching network)
-# ======================================================
-def load_cached_price_data(symbol: str):
+def load_cached_price_data(symbol: str) -> pd.DataFrame:
+    """
+    Load local CSV cache.
+    Perform incremental update ONLY if missing >= 2 days.
+    Ensures correct OHLC & correct dates.
+    """
+
     path = CACHE_DIR / f"{symbol}.csv"
     today = date.today()
 
-    # 1) CACHE MISSING → full fetch
+    # --------- NO CACHE: full refresh
     if not path.exists():
         return refresh_and_load(symbol)
 
+    # --------- LOAD CACHE
     try:
         df = pd.read_csv(path)
     except Exception:
-        # corrupt file → overwrite fully
+        # corrupted → rebuild
         return refresh_and_load(symbol)
 
+    # Clean it (handles MultiIndex CSVs too)
     df = _clean_yahoo_df(df)
-
     if df.empty:
         return refresh_and_load(symbol)
 
-    # Ensure sorted
-    df.sort_values("Date", inplace=True)
-    df.reset_index(drop=True, inplace=True)
+    df = df.sort_values("Date")
+    df = df.reset_index(drop=True)
 
     last_date = df["Date"].max().date()
-    delta = (today - last_date).days
+    missing_days = (today - last_date).days
 
-    # 2) CACHE IS CURRENT OR 1 DAY BEHIND → return without yahoo call
-    if delta <= 1:
+    # --------- UP-TO-DATE (within 1 day)
+    if missing_days <= 1:
         return df
 
-    # 3) Incremental update for only missing days
+    # --------- DOWNLOAD ONLY NEW DAYS
     start_missing = (last_date + timedelta(days=1)).strftime("%Y-%m-%d")
     end_missing = today.strftime("%Y-%m-%d")
 
-    new_df = yf.download(
-        symbol,
-        start=start_missing,
-        end=end_missing,
-        auto_adjust=False,
-        progress=False,
-    )
+    new_data = _download_yahoo(symbol, start_missing, end_missing)
+    if new_data.empty:
+        return df  # Nothing new (weekend/holiday)
 
-    # If Yahoo gives nothing (weekend/holiday)
-    if new_df is None or new_df.empty:
-        return df
+    # Merge (prefer newest copy)
+    merged = pd.concat([df, new_data], ignore_index=True)
+    merged = merged.drop_duplicates(subset=["Date"], keep="last")
+    merged = merged.sort_values("Date")
+    merged = merged.reset_index(drop=True)
 
-    new_df = _clean_yahoo_df(new_df)
-
-    # If cleaning yields nothing, keep old cache
-    if new_df.empty:
-        return df
-
-    # merge
-    merged = pd.concat([df, new_df], ignore_index=True)
-    merged.drop_duplicates(subset=["Date"], keep="last", inplace=True)
-    merged.sort_values("Date", inplace=True)
-    merged.reset_index(drop=True, inplace=True)
-
+    # Save updated cache
     merged.to_csv(path, index=False)
+
     return merged
 
 
-# ======================================================
-# PRICE LOOKUP
-# ======================================================
 def load_price_on_date(symbol: str, date_str: str):
+    """
+    Return a single row of OHLCV for the exact date.
+    """
     df = load_cached_price_data(symbol)
     ts = pd.Timestamp(date_str)
     row = df[df["Date"] == ts]
+
     return None if row.empty else row.iloc[0]

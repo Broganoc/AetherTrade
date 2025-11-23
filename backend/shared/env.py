@@ -194,40 +194,57 @@ class OptionTradingEnv(gym.Env):
     import math
 
     def _choose_otm_strike(self, S, action, moneyness=0.01):
-        """
-        Realistic mixed strike increments:
-          - ATM ± $10 → $1 increments
-          - Outside that → $5 increments
+        price = float(S)
 
-        CALL: raw = S * (1 + moneyness)
-        PUT:  raw = S * (1 - moneyness)
-
-        Ensures clean US equity option strike values.
-        """
-
-        # Step 1: compute raw OTM strike target
-        if action == "CALL":
-            raw = S * (1 + moneyness)
-        elif action == "PUT":
-            raw = S * (1 - moneyness)
-        else:
-            raw = S
-
-        # Step 2: determine increment based on distance from ATM
-        # Within $10 → $1 strike increments
-        # Beyond $10 → $5 strike increments
-        if abs(raw - S) <= 10:
-            inc = 1.00
-        else:
+        # Robinhood-style increments
+        if price < 5:
+            inc = 0.50
+        elif price < 25:
+            inc = 2.50
+        elif price < 200:
             inc = 5.00
-
-        # Step 3: round properly depending on direction
-        if action == "CALL":
-            strike = math.ceil(raw / inc) * inc
-        elif action == "PUT":
-            strike = math.floor(raw / inc) * inc
         else:
-            strike = round(raw / inc) * inc
+            inc = 10.00
+
+        if action.upper() == "CALL":
+            raw = price * (1 + moneyness)
+            strike = math.ceil(raw / inc) * inc
+
+            # ensure actually above spot
+            if strike <= price:
+                strike += inc
+
+
+
+        elif action.upper() == "PUT":
+
+            raw = price * (1 - moneyness)
+
+            # raw OTM strike from moneyness
+
+            raw_strike = math.floor(raw / inc) * inc
+
+            # closest strike BELOW spot
+
+            first_otm = math.floor(price / inc) * inc
+
+            if first_otm >= price:
+                first_otm -= inc
+
+            # pick whichever is closer to raw target
+
+            if abs(raw - raw_strike) < abs(raw - first_otm):
+
+                strike = raw_strike
+
+            else:
+
+                strike = first_otm
+
+
+
+        else:
+            strike = round(price / inc) * inc
 
         return float(round(strike, 2))
 
@@ -424,6 +441,37 @@ class OptionTradingEnv(gym.Env):
             return S * norm.cdf(d1) - K * math.exp(-r * T) * norm.cdf(d2)
         else:
             return K * math.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
+
+    def apply_market_microstructure(self, theoretical_price: float, iv_boost: float = 1.25) -> float:
+        """
+        Convert a theoretical BS price into a more realistic market mid:
+          - boost for higher implied volatility vs realized
+          - add a simple bid/ask-style spread that widens for cheap options
+        """
+        p = float(theoretical_price)
+
+        if p <= 0:
+            return 0.0
+
+        # 1) Boost for typical IV premium (market IV > modeled IV)
+        p_adj = p * iv_boost
+
+        # 2) Add spread based on price level
+        if p_adj < 1:
+            spread = 0.20
+        elif p_adj < 5:
+            spread = 0.30
+        elif p_adj < 10:
+            spread = 0.50
+        else:
+            spread = 1.00
+
+        bid = max(p_adj - spread / 2.0, 0.05)
+        ask = p_adj + spread / 2.0
+
+        mid = (bid + ask) / 2.0
+        return mid
+
 
     def _bs_intraday_return(self, S_entry, S_exit, sigma, option_type, moneyness=0.01):
         """
