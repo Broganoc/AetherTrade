@@ -34,59 +34,85 @@ class OptionTradingEnv(gym.Env):
 
     metadata = {"render_modes": ["human"]}
 
-    def __init__(self, symbol: str, start="2020-01-01", end="2023-01-01"):
+    def __init__(self, symbol: str, start="2020-01-01", end="2025-01-01"):
         super().__init__()
         self.symbol = symbol
         self.start = start
         self.end = end
         self.full_run = False
 
-        # --- Load data from cache ---
+        # ============================
+        # 1. Load data from cache
+        # ============================
         full_df = load_cached_price_data(self.symbol)
 
-        # Convert dates
+        if full_df is None or full_df.empty:
+            raise ValueError(f"[SKIP] No price data for {self.symbol}. Env cannot be created.")
+
+        # Must have essential columns
+        required = {"Date", "Open", "High", "Low", "Close", "Volume"}
+        missing = required - set(full_df.columns)
+        if missing:
+            raise ValueError(f"[SKIP] {self.symbol} cache missing columns: {missing}")
+
+        full_df["Date"] = pd.to_datetime(full_df["Date"], errors="coerce")
+        full_df.dropna(subset=["Date"], inplace=True)
+
+        if full_df.empty:
+            raise ValueError(f"[SKIP] {self.symbol} has no valid dated rows.")
+
+        # ============================
+        # 2. Clamp date window
+        # ============================
         req_start = pd.to_datetime(self.start)
         req_end = pd.to_datetime(self.end)
 
-        # Clamp to available range
         df_min = full_df["Date"].min()
         df_max = full_df["Date"].max()
 
         start_ts = max(req_start, df_min)
         end_ts = min(req_end, df_max)
 
-        # Slice
         mask = (full_df["Date"] >= start_ts) & (full_df["Date"] <= end_ts)
-        self.df = full_df.loc[mask].copy()
+        sliced = full_df.loc[mask].copy()
 
-        # If still empty, fallback
-        if self.df.empty:
-            print(
-                f"[WARN] No cached data for {self.symbol} within requested or clamped range. "
-                f"Falling back to full dataset ({df_min.date()} → {df_max.date()})."
-            )
-            self.df = full_df.copy()
+        if sliced.empty:
+            print(f"[WARN] {self.symbol}: No data in requested range. Using full cache.")
+            sliced = full_df.copy()
 
-        # Compute indicators
+        self.df = sliced
+
+        # ============================
+        # 3. Indicators
+        # ============================
         self._add_indicators()
         self._normalize_features()
 
-        # --- Observation settings ---
+        # ============================
+        # 4. Observation & action spaces
+        # ============================
         self.window_size = 7
-        self.feature_count = 7  # Close, RSI, VWAP, EMA9, MACD, Volume, Volatility
+        self.feature_count = 7
+
         self.observation_space = spaces.Box(
-            low=-5, high=5, shape=(self.window_size * self.feature_count,), dtype=np.float32
+            low=-5, high=5,
+            shape=(self.window_size * self.feature_count,),
+            dtype=np.float32
         )
 
         self.action_space = spaces.Discrete(3)
 
-        # --- Option model params ---
-        self.r = 0.02                  # risk-free rate
-        self.theta_decay = -0.005      # daily time decay penalty
-        self.leverage = 5.0            # scales premium returns into [-1,1]
-        self.dte_days = 40             # target DTE (training reward only)
+        # ============================
+        # 5. Option Reward Parameters
+        # ============================
+        self.r = 0.02
+        self.theta_decay = -0.005
+        self.leverage = 5.0
+        self.dte_days = 40
 
-        # Episode tracking
+        # ============================
+        # 6. Episode State
+        # ============================
         self.current_step = 0
         self.episode_end = 0
         self.episode_length = 0
@@ -496,9 +522,6 @@ class OptionTradingEnv(gym.Env):
 
         return (price_exit - price_entry) / price_entry
 
-    # -------------------------------------------------
-    # Reset
-    # -------------------------------------------------
     def reset(self, seed=None, options=None, full_run: bool = False):
         super().reset(seed=seed)
 
@@ -506,7 +529,11 @@ class OptionTradingEnv(gym.Env):
         if total_steps < 5:
             print(f"[WARN] Not enough rows ({total_steps}), reloading full cached file.")
 
-            full_df = load_cached_price_data(self.symbol).copy()
+            full_df = load_cached_price_data(self.symbol)
+            if full_df is None or full_df.empty:
+                raise ValueError(f"[FATAL] No price data available for {self.symbol} during reset().")
+
+            full_df = full_df.copy()
             full_df.dropna(subset=["Open", "High", "Low", "Close"], inplace=True)
             self.df = full_df
 
@@ -516,7 +543,7 @@ class OptionTradingEnv(gym.Env):
 
             total_steps = len(self.df)
             if total_steps < 5:
-                raise ValueError(f"Still not enough data for {self.symbol}")
+                raise ValueError(f"[FATAL] Still not enough data to run {self.symbol}")
 
         self.full_run = full_run
 

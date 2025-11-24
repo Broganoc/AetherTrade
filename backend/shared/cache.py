@@ -79,17 +79,21 @@ def _download_yahoo(symbol: str, start: str, end: str) -> pd.DataFrame:
 # PUBLIC API
 # ======================================================
 
-def refresh_and_load(symbol: str) -> pd.DataFrame:
+def refresh_and_load(symbol: str) -> pd.DataFrame | None:
     """
     Completely rewrite cache for this symbol.
     Downloads all data from 2010 → today.
+    Returns None if symbol is invalid or has no data.
     """
     today = date.today().strftime("%Y-%m-%d")
     start = "2010-01-01"
 
     df = _download_yahoo(symbol, start, today)
-    if df.empty:
-        raise ValueError(f"Yahoo returned empty dataset for refresh: {symbol}")
+
+    # Catch delisted / bad symbols
+    if df is None or df.empty:
+        print(f"[WARN] No Yahoo data for {symbol}. Skipping.")
+        return None
 
     # Save
     out_path = CACHE_DIR / f"{symbol}.csv"
@@ -98,60 +102,63 @@ def refresh_and_load(symbol: str) -> pd.DataFrame:
     return df
 
 
-def load_cached_price_data(symbol: str) -> pd.DataFrame:
+def load_cached_price_data(symbol: str) -> pd.DataFrame | None:
     """
     Load local CSV cache.
-    Perform incremental update ONLY if missing >= 2 days.
-    Ensures correct OHLC & correct dates.
+    Returns None when symbol is invalid/delisted.
     """
 
     path = CACHE_DIR / f"{symbol}.csv"
     today = date.today()
 
-    # --------- NO CACHE: full refresh
+    # --------- NO CACHE: attempt full refresh
     if not path.exists():
-        return refresh_and_load(symbol)
+        df = refresh_and_load(symbol)
+        return df  # may be None
 
     # --------- LOAD CACHE
     try:
         df = pd.read_csv(path)
     except Exception:
         # corrupted → rebuild
-        return refresh_and_load(symbol)
+        df = refresh_and_load(symbol)
+        return df  # may be None
 
-    # Clean it (handles MultiIndex CSVs too)
+    # Clean it
     df = _clean_yahoo_df(df)
-    if df.empty:
-        return refresh_and_load(symbol)
+    if df is None or df.empty:
+        df = refresh_and_load(symbol)
+        return df  # may be None
 
-    df = df.sort_values("Date")
-    df = df.reset_index(drop=True)
+    df = df.sort_values("Date").reset_index(drop=True)
 
     last_date = df["Date"].max().date()
     missing_days = (today - last_date).days
 
-    # --------- UP-TO-DATE (within 1 day)
+    # --------- Cache is current
     if missing_days <= 1:
         return df
 
-    # --------- DOWNLOAD ONLY NEW DAYS
+    # --------- Incremental update
     start_missing = (last_date + timedelta(days=1)).strftime("%Y-%m-%d")
     end_missing = today.strftime("%Y-%m-%d")
 
     new_data = _download_yahoo(symbol, start_missing, end_missing)
-    if new_data.empty:
-        return df  # Nothing new (weekend/holiday)
 
-    # Merge (prefer newest copy)
+    # If Yahoo returns nothing (market closed or invalid symbol)
+    if new_data is None or new_data.empty:
+        return df
+
+    # Merge & dedupe
     merged = pd.concat([df, new_data], ignore_index=True)
     merged = merged.drop_duplicates(subset=["Date"], keep="last")
-    merged = merged.sort_values("Date")
-    merged = merged.reset_index(drop=True)
+    merged = merged.sort_values("Date").reset_index(drop=True)
 
-    # Save updated cache
+    # Save updated
     merged.to_csv(path, index=False)
 
     return merged
+
 
 
 def load_price_on_date(symbol: str, date_str: str):

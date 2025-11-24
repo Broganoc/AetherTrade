@@ -90,26 +90,52 @@ def _parse_symbols(symbol: Union[str, List[str]]) -> List[str]:
 
 
 def make_env(symbol: str):
-    full_start = date(2010, 1, 1)
-    full_end   = date(2025, 1, 1)
-
-    def random_window():
-        end_ts = full_start + timedelta(
-            days=np.random.randint(365, (full_end - full_start).days)
-        )
-        start_ts = end_ts - timedelta(days=365)
-        return start_ts, end_ts
-
+    """
+    Create an environment factory for a single symbol.
+    Uses the full available history; randomness is handled in env.reset().
+    """
     def _init():
-        start_ts, end_ts = random_window()
         env = OptionTradingEnv(
             symbol=symbol,
-            start=start_ts.isoformat(),
-            end=end_ts.isoformat()
+            start="2010-01-01",
+            end="2025-01-01"
         )
         return Monitor(env)
 
     return _init
+
+
+def filter_valid_envs(symbols):
+    """
+    Try to build a single env per symbol.
+    Only keep symbols for which OptionTradingEnv can be created successfully.
+    """
+    valid = []
+    skipped = []
+
+    for sym in symbols:
+        try:
+            # Dry-run: try to create one full-history env.
+            # This will raise if:
+            #  - no cache
+            #  - not enough rows to compute indicators
+            #  - bad columns, etc.
+            env = OptionTradingEnv(
+                symbol=sym,
+                start="2010-01-01",
+                end="2025-01-01"
+            )
+            # Extra safety: require enough rows even after indicators
+            if getattr(env, "df", None) is None or len(env.df) < 40:
+                raise ValueError(f"Too few rows after indicators for {sym} (len={len(getattr(env, 'df', []))})")
+
+            valid.append(sym)
+        except Exception as e:
+            print(f"[SKIP] {sym}: {e}")
+            skipped.append(sym)
+
+    return valid, skipped
+
 
 
 # ======================================================
@@ -345,6 +371,30 @@ def _update_best_checkpoint(model_path: Path, env: VecNormalize, model: PPO,
 
     return float(current_best) if current_best is not None else None
 
+def filter_valid_envs(symbols, train_start=None, train_end=None):
+    """
+    Attempt to instantiate OptionTradingEnv once per symbol.
+    Only return symbols that successfully load.
+    """
+    valid = []
+    skipped = []
+
+    for s in symbols:
+        try:
+            # create one test instance — will raise if data missing
+            _ = OptionTradingEnv(
+                symbol=s,
+                start=train_start or "2020-01-01",
+                end=train_end or "2025-01-01"
+            )
+            valid.append(s)
+        except Exception as e:
+            print(f"[SKIP] {s}: {e}")
+            skipped.append(s)
+
+    return valid, skipped
+
+
 
 # ======================================================
 # STREAMING TRAINER (1-year env)
@@ -359,8 +409,17 @@ async def train_agent_stream(symbol, model_name="ppo_agent_v1",
     if not symbols:
         raise ValueError("No valid symbols provided.")
 
-    # Always 1-year window envs
-    env_fns = [make_env(sym) for sym in symbols]
+    # Validate symbols FIRST
+    valid_symbols, skipped = filter_valid_envs(symbols)
+
+    if skipped:
+        print(f"[WARN] Skipped invalid symbols: {skipped}")
+
+    if not valid_symbols:
+        raise ValueError("No usable symbols after filtering. Training cannot continue.")
+
+    # Build envs only for valid symbols
+    env_fns = [make_env(sym) for sym in valid_symbols]
     base_env = DummyVecEnv(env_fns)
     env = VecNormalize(base_env, norm_obs=True, norm_reward=False, clip_obs=5.0)
 
@@ -384,7 +443,8 @@ async def train_agent_stream(symbol, model_name="ppo_agent_v1",
         tensorboard_log=str(LOGS_DIR / "tensorboard")
     )
 
-    model_path = MODELS_DIR / f"{model_name}_{symbols[0] if len(symbols)==1 else 'MULTI'}.zip"
+    # Use valid_symbols for naming
+    model_path = MODELS_DIR / f"{model_name}_{valid_symbols[0] if len(valid_symbols)==1 else 'MULTI'}.zip"
     chunk_steps = max(1, total_timesteps // chunks)
     start_time = time.time()
 
@@ -392,7 +452,8 @@ async def train_agent_stream(symbol, model_name="ppo_agent_v1",
     start_payload = {
         "status": "started",
         "mode": "train",
-        "symbols": symbols,
+        "symbols": valid_symbols,  # <-- use valid list
+        "skipped_symbols": skipped,
         "model_name": model_name,
         "total_timesteps": total_timesteps,
         "chunks": chunks,
@@ -409,6 +470,8 @@ async def train_agent_stream(symbol, model_name="ppo_agent_v1",
                 cancel_payload = {
                     "status": "cancelled",
                     "mode": "train",
+                    "symbols": valid_symbols,
+                    "skipped_symbols": skipped,
                     "timestamp": _utc_now_iso()
                 }
                 write_status(cancel_payload)
@@ -435,7 +498,8 @@ async def train_agent_stream(symbol, model_name="ppo_agent_v1",
             payload = {
                 "status": "training",
                 "mode": "train",
-                "symbols": symbols,
+                "symbols": valid_symbols,
+                "skipped_symbols": skipped,
                 "model_name": model_name,
                 "chunk": i + 1,
                 "chunks": chunks,
@@ -469,7 +533,8 @@ async def train_agent_stream(symbol, model_name="ppo_agent_v1",
 
         metrics_data.update({
             "model_name": model_path.stem,
-            "symbols": symbols,
+            "symbols": valid_symbols,
+            "skipped_symbols": skipped,
             "trained_on": str(date.today()),
             "framework": "stable-baselines3",
             "path": str(model_path),
@@ -488,7 +553,8 @@ async def train_agent_stream(symbol, model_name="ppo_agent_v1",
         done_payload = {
             "status": "completed",
             "mode": "train",
-            "symbols": symbols,
+            "symbols": valid_symbols,
+            "skipped_symbols": skipped,
             "model_name": model_path.stem,
             "model_path": str(model_path),
             "mean_reward": stats["mean_reward"],
@@ -502,9 +568,17 @@ async def train_agent_stream(symbol, model_name="ppo_agent_v1",
         yield f"data: {json.dumps(done_payload)}\n\n"
 
     except Exception as e:
-        err = {"status": "error", "mode": "train", "message": str(e), "timestamp": _utc_now_iso()}
+        err = {
+            "status": "error",
+            "mode": "train",
+            "symbols": valid_symbols,
+            "skipped_symbols": skipped,
+            "message": str(e),
+            "timestamp": _utc_now_iso()
+        }
         write_status(err)
         yield f"data: {json.dumps(err)}\n\n"
+
 
 
 # ======================================================
@@ -564,7 +638,13 @@ async def resume_training_stream(model_filename: str,
             inferred_symbols = [last]
 
     # Always use latest 1-year window for resume
-    env_fns = [make_env(sym) for sym in inferred_symbols]
+    valid_symbols, skipped = filter_valid_envs(inferred_symbols)
+    if skipped:
+        print(f"[WARN] resume_training_stream skipped: {skipped}")
+    if not valid_symbols:
+        raise ValueError("No valid symbols found for resume.")
+
+    env_fns = [make_env(sym) for sym in valid_symbols]
     base_env = DummyVecEnv(env_fns)
 
     if vec_path.exists():
@@ -753,7 +833,13 @@ async def full_train_stream(model_filename: str,
         inferred_symbols = ["AAPL", "MSFT"] if last == "MULTI" else [last]
 
     # Build env
-    env_fns = [make_env(sym) for sym in inferred_symbols]
+    valid_symbols, skipped = filter_valid_envs(inferred_symbols)
+    if skipped:
+        print(f"[WARN] full_train_stream skipped: {skipped}")
+    if not valid_symbols:
+        raise ValueError("No valid symbols available for full_train_stream.")
+
+    env_fns = [make_env(sym) for sym in valid_symbols]
     base_env = DummyVecEnv(env_fns)
 
     if vec_path.exists():
