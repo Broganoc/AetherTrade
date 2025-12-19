@@ -110,6 +110,61 @@ def get_predictor(model_name: str) -> ModelPredictor:
 
 
 # ------------------------------------------------------------
+# NEW: Historical OHLC normalization helpers (for /genHistPreds)
+# ------------------------------------------------------------
+def _clean_daily_index(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalize OHLC dataframe to a clean daily DatetimeIndex:
+    - Index becomes timezone-naive midnight (YYYY-MM-DD 00:00:00)
+    - Sorted
+    - Deduped per day
+    """
+    # If df has a Date column (some cache variants do), prefer it
+    if "Date" in df.columns:
+        dts = pd.to_datetime(df["Date"], errors="coerce", utc=True)
+        df = df.copy()
+        df["Date"] = dts
+        df = df.dropna(subset=["Date"]).set_index("Date")
+
+    # Coerce index to datetime, handle tz
+    idx = pd.to_datetime(df.index, errors="coerce", utc=True)
+    df = df.copy()
+    df.index = idx
+    df = df[~df.index.isna()]
+
+    # Force to daily calendar dates in UTC, then make tz-naive and normalized
+    df.index = df.index.tz_convert("UTC").tz_localize(None).normalize()
+
+    # Sort + dedupe by day (keep last row for a day if duplicates exist)
+    df = df.sort_index()
+    df = df[~df.index.duplicated(keep="last")]
+
+    return df
+
+
+def _window_ending_on_target(df: pd.DataFrame, target_day: date, lookback: int) -> pd.DataFrame:
+    """
+    Returns exactly (lookback + 1) rows ending on the last available trading day
+    on-or-before target_day.
+    """
+    ts_target = pd.Timestamp(target_day).normalize()
+
+    # Up to the target calendar day
+    df_upto = df.loc[:ts_target]
+    if df_upto.empty:
+        raise ValueError("No rows on/before target_day")
+
+    # Effective trading day is the last bar available <= target_day
+    effective_ts = df_upto.index[-1]
+
+    window = df.loc[:effective_ts].tail(lookback + 1)
+    if len(window) < lookback + 1:
+        raise ValueError("Insufficient rows for lookback window")
+
+    return window
+
+
+# ------------------------------------------------------------
 # Routes: models & predictions
 # ------------------------------------------------------------
 @app.get("/models")
@@ -563,32 +618,27 @@ def backtest_all():
     }
 
 
-
 # ------------------------------------------------------------
 # Historical prediction generation (real predictions, date-patched)
 # ------------------------------------------------------------
 @app.post("/genHistPreds")
 def generate_historical_real_predictions(
-    days: int = Query(30, description="Number of past days to generate predictions for"),
-    symbols: List[str] = Query(default=None, description="Optional list of tickers. Defaults to NASDAQ100."),
+    days: int = Query(30),
+    symbols: List[str] = Query(default=None),
 ):
     """
-    Generate REAL historical predictions for each model for each past day.
-
-    Uses the updated ModelPredictor with target_date support.
+    Generate REAL historical predictions for each past day.
+    Ensures predictor uses correct historical OHLC for the target_date.
     """
     from shared.cache import load_cached_price_data, refresh_and_load
 
-    # Default symbols = NASDAQ 100
     if not symbols:
         from shared.symbols import NASDAQ_100 as NAS100
-
         symbols = NAS100
 
     today = date.today()
     start_day = today - timedelta(days=days)
 
-    # Collect available model zip files
     model_list = [f.stem for f in MODELS_DIR.glob("*.zip")]
     if not model_list:
         return {"success": False, "detail": "No models found."}
@@ -597,64 +647,66 @@ def generate_historical_real_predictions(
     skipped = {}
 
     for model_name in model_list:
+        # symbol suffix logic
         parts = model_name.split("_")
-
-        # Correct, unified suffix logic
-        if parts[-1] == "best":
-            model_suffix = f"{parts[-2]}_best"
-        else:
-            model_suffix = parts[-1]
+        model_suffix = f"{parts[-2]}_best" if parts[-1] == "best" else parts[-1]
 
         generated[model_name] = []
         skipped[model_name] = []
 
-        # Load predictor instance once per model
         predictor = get_predictor(model_name)
 
-        # Loop historical days
         for i in range(days):
             target_day = start_day + timedelta(days=i)
-
             if target_day >= today:
-                continue  # skip today or future
+                continue
 
             date_str = target_day.strftime("%Y-%m-%d")
             log_filename = f"{date_str}_predictions_{model_suffix}.json"
             log_path = LOG_DIR / log_filename
 
-            # Skip existing files
             if log_path.exists():
                 skipped[model_name].append(log_filename)
                 continue
 
-            # Ensure cached symbol data exists
+            # ----------------------------
+            # ENSURE HISTORICAL PRICE CORRECTNESS (PATCHED)
+            # - normalizes tz / times to daily midnight
+            # - selects effective trading day <= target_day
+            # - passes ONLY (lookback+1) rows to predictor
+            # ----------------------------
+            per_symbol_data = {}
+            LOOKBACK = 7
+
             for sym in symbols:
                 try:
                     df = load_cached_price_data(sym)
-
-                    if len(df) < 50:  # low threshold = at least enough for indicators
-                        raise ValueError("Insufficient cached data for indicators")
+                    df = _clean_daily_index(df)
+                    df_window = _window_ending_on_target(df, target_day, lookback=LOOKBACK)
+                    per_symbol_data[sym] = df_window
 
                 except Exception as err:
-                    print(f"[Historical] Cache load failed for {sym} ({err}). Attempting refresh...")
-
+                    print(f"[Historical] Cache load failed for {sym} ({err}). Trying refresh...")
                     try:
                         df = refresh_and_load(sym)
-                        print(f"[Historical] Successfully refreshed {sym}")
-
+                        df = _clean_daily_index(df)
+                        df_window = _window_ending_on_target(df, target_day, lookback=LOOKBACK)
+                        per_symbol_data[sym] = df_window
                     except Exception as err2:
-                        print(f"[Historical] SKIPPING {sym}: Yahoo returned no data ({err2})")
-                        continue  # just skip this symbol entirely
+                        print(f"[Historical] SKIP {sym}: No usable data ({err2})")
+                        continue
 
-            # Generate REAL predictions for that date
+            # ----------------------------
+            # RUN PREDICTIONS CORRECTLY
+            # ----------------------------
             try:
                 output = predictor.batch_predict(
-                    symbols,
-                    lookback=7,
+                    list(per_symbol_data.keys()),
+                    lookback=LOOKBACK,
                     target_date=date_str,
+                    override_price_data=per_symbol_data,  # <-- NEW CRITICAL PARAM
                 )
 
-                # Save to file
                 with open(log_path, "w") as f:
                     json.dump(output, f, indent=2)
 

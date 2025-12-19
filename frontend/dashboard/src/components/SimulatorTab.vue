@@ -225,12 +225,14 @@
 <script>
 export default {
   data() {
+    const today = new Date().toISOString().substring(0, 10);
+
     return {
       models: [],
       selectedModel: "",
       symbol: "",
       startDate: "2025-10-01",
-      endDate: "2025-11-10",
+      endDate: today,
       startingBalance: 10000,
       simResult: null,
       validationError: "",
